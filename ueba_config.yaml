@@ -1,0 +1,133 @@
+# UEBA Configuration
+# User and Entity Behavior Analytics settings
+
+# Anomaly detection thresholds
+thresholds:
+  # Volume spike detection
+  volume_spike_multiplier: 3.0  # Alert if volume > mean * this multiplier
+  
+  # Temporal anomalies
+  unusual_hour_threshold: 0.1   # Hour must have >10% of activity to be "normal"
+  
+  # Geographic anomalies
+  max_normal_countries: 5       # More than this = suspicious
+  max_normal_ips: 20            # More than this = suspicious
+
+# Risk scoring weights
+risk_weights:
+  # Anomaly severity weights (out of 100)
+  critical_anomaly: 30
+  high_anomaly: 20
+  medium_anomaly: 10
+  low_anomaly: 5
+  
+  # Component weights (should sum to 1.0)
+  enrichment_weight: 0.3
+  anomaly_weight: 0.4
+  deviation_weight: 0.2
+  newness_weight: 0.1
+
+# Baseline learning
+baseline:
+  # Minimum events to establish baseline
+  min_events_for_baseline: 10
+  
+  # Baseline learning window (days)
+  learning_window_days: 30
+  
+  # Baseline refresh (re-learn after this many days)
+  refresh_after_days: 90
+
+# Entity types to track
+entity_types:
+  - user              # User accounts
+  - source_ip         # Source IP addresses
+  - host              # Host systems
+  - service_account   # Service/system accounts
+
+# Anomaly types configuration
+anomaly_types:
+  first_time_ip:
+    enabled: true
+    severity: medium
+    confidence: 0.8
+    description: "First time seeing this IP for entity"
+  
+  first_time_country:
+    enabled: true
+    severity: high
+    confidence: 0.9
+    description: "First time seeing this country for entity"
+  
+  unusual_hour:
+    enabled: true
+    severity: medium
+    confidence: 0.7
+    description: "Activity outside normal hours"
+  
+  unusual_day:
+    enabled: true
+    severity: medium
+    confidence: 0.6
+    description: "Activity on unusual day of week"
+  
+  volume_spike:
+    enabled: true
+    severity: medium
+    confidence: 0.7
+    description: "Unusual increase in event volume"
+  
+  tor_usage:
+    enabled: true
+    severity: high
+    confidence: 0.95
+    description: "Entity using Tor network"
+  
+  malicious_ip:
+    enabled: true
+    severity: critical
+    confidence: 1.0
+    description: "Communication with known malicious IP"
+  
+  impossible_travel:
+    enabled: true
+    severity: critical
+    confidence: 0.95
+    description: "Geographic travel that is physically impossible"
+  
+  first_time_protocol:
+    enabled: true
+    severity: low
+    confidence: 0.5
+    description: "First time using this protocol"
+
+# Peer group analysis (future feature)
+peer_groups:
+  enabled: false
+  group_by:
+    - department
+    - role
+    - location
+
+# Output settings
+output:
+  # Minimum UEBA score to output (0-100)
+  min_score_threshold: 40
+  
+  # Include baseline details in output
+  include_baseline_details: true
+  
+  # Include full event in output
+  include_full_event: false
+
+# Performance tuning
+performance:
+  # Maximum entities to track in memory
+  max_entities: 100000
+  
+  # Cleanup old baselines (days of inactivity)
+  cleanup_inactive_after_days: 90
+
+metadata:
+  version: "1.0"
+  last_updated: "2026-02-06"

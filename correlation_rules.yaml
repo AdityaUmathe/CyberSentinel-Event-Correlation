@@ -1,0 +1,529 @@
+# Correlation Rules Configuration
+# Event correlation rules for security detection
+
+rules:
+  # ============================================================================
+  # Category 1: Threat Intelligence
+  # ============================================================================
+  
+  - id: TI-001
+    name: Malicious IP Communication
+    type: single
+    category: threat_intelligence
+    severity: critical
+    description: Communication with known malicious IP address
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      OR:
+        - enrich.network_intel.src_reputation.ip_reputation: malicious
+        - enrich.network_intel.dest_reputation.ip_reputation: malicious
+    response:
+      - Block source IP at firewall
+      - Isolate affected host from network
+      - Investigate all recent connections from this IP
+      - Check for malware/backdoor on affected systems
+
+  - id: TI-002
+    name: Tor Exit Node Communication
+    type: single
+    category: threat_intelligence
+    severity: high
+    description: Traffic from or to Tor exit node
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      AND:
+        - OR:
+            - enrich.network_intel.src_tor.is_exit_node: true
+            - enrich.network_intel.dest_tor.is_exit_node: true
+        - enrich.classification.is_external_outbound: true
+    response:
+      - Verify if authorized privacy tool or VPN
+      - Review user activity and accessed resources
+      - Check for data exfiltration attempts
+      - Consider blocking Tor traffic per policy
+
+  - id: TI-003
+    name: High-Risk Country Communication
+    type: single
+    category: threat_intelligence
+    severity: medium
+    description: Communication with high-risk geolocation
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      AND:
+        - enrich.geo.src.country_code:
+            in: ["CN", "RU", "KP", "IR", "SY"]
+        - enrich.classification.is_external_inbound: true
+        - enrich.normalization.action: allowed
+    response:
+      - Review connection logs and accessed resources
+      - Verify legitimate business need for connection
+      - Check for unusual data access patterns
+      - Consider geo-blocking if not business-critical
+
+  # ============================================================================
+  # Category 2: Brute Force & Authentication Attacks
+  # ============================================================================
+
+  - id: AUTH-001
+    name: Brute Force Attack - Single Source
+    type: single
+    category: authentication
+    severity: high
+    description: Multiple failed authentication attempts from single source
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0006  # Credential Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: denied
+        - enrich.behavioral.recent_failures_5m:
+            gte: 10
+    response:
+      - Block source IP temporarily (15-30 minutes)
+      - Alert security team for investigation
+      - Review authentication logs for pattern
+      - Consider implementing rate limiting
+
+  - id: AUTH-002
+    name: Distributed Brute Force Attack
+    type: aggregation
+    category: authentication
+    severity: critical
+    description: Authentication attempts from multiple sources to same account
+    enabled: true
+    false_positive_rate: low
+    time_window: 600  # 10 minutes
+    mitre_tactics:
+      - TA0006  # Credential Access
+    group_by:
+      - subject.name
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: denied
+    threshold:
+      count:
+        gte: 5
+    response:
+      - Lock target account immediately
+      - Block all attacking source IPs
+      - Force password reset on account
+      - Investigate for credential stuffing attack
+
+  - id: AUTH-003
+    name: Successful Login After Failed Attempts
+    type: single
+    category: authentication
+    severity: critical
+    description: Successful authentication following multiple failures (possible compromise)
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0006  # Credential Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.behavioral.recent_failures_5m:
+            gte: 5
+    response:
+      - Assume account compromise - force logout
+      - Require password reset immediately
+      - Enable MFA if not already enabled
+      - Review all activity after successful login
+      - Check for privilege escalation attempts
+
+  # ============================================================================
+  # Category 3: Network Scanning & Reconnaissance
+  # ============================================================================
+
+  - id: SCAN-001
+    name: Port Scan Detected
+    type: single
+    category: reconnaissance
+    severity: high
+    description: Source IP scanning multiple ports
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0043  # Reconnaissance
+    conditions:
+      AND:
+        - enrich.anomalies.is_port_scan: true
+        - enrich.classification.src_ip_type: public
+    response:
+      - Block source IP at perimeter firewall
+      - Check if authorized penetration test
+      - Review firewall logs for exploitation attempts
+      - Alert security team for analysis
+
+  - id: SCAN-002
+    name: Network Sweep Detected
+    type: single
+    category: reconnaissance
+    severity: high
+    description: Source scanning multiple internal hosts
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0043  # Reconnaissance
+    conditions:
+      AND:
+        - enrich.behavioral.unique_destinations_1h:
+            gte: 30
+        - enrich.counters.src_ip_5m:
+            gte: 50
+    response:
+      - Identify scanning tool/technique being used
+      - Block at network perimeter
+      - Check systems for successful exploits
+      - Review IDS/IPS logs for attack signatures
+
+  - id: SCAN-003
+    name: High-Frequency Scanning
+    type: single
+    category: reconnaissance
+    severity: medium
+    description: Unusually high connection rate from single source
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0043  # Reconnaissance
+    conditions:
+      AND:
+        - enrich.anomalies.is_high_frequency: true
+        - enrich.behavioral.unique_destinations_1h:
+            gte: 10
+        - enrich.temporal.is_after_hours: true
+    response:
+      - Monitor for escalation to exploitation
+      - Review connection patterns
+      - Check for automated scanning tools
+      - Consider rate limiting
+
+  # ============================================================================
+  # Category 4: Lateral Movement
+  # ============================================================================
+
+  - id: LATERAL-001
+    name: Internal Lateral Movement
+    type: single
+    category: lateral_movement
+    severity: critical
+    description: Unusual internal host-to-host connections
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0008  # Lateral Movement
+    conditions:
+      AND:
+        - enrich.anomalies.is_lateral_movement: true
+        - enrich.classification.is_internal_traffic: true
+        - enrich.temporal.is_after_hours: true
+    response:
+      - Isolate source host immediately
+      - Check for malware, backdoors, or unauthorized tools
+      - Review authentication logs for stolen credentials
+      - Investigate recent security events on source host
+      - Check all destination hosts for compromise
+
+  - id: LATERAL-002
+    name: Rapid Internal Host Hopping
+    type: aggregation
+    category: lateral_movement
+    severity: critical
+    description: Single source accessing many internal systems
+    enabled: true
+    false_positive_rate: low
+    time_window: 3600  # 1 hour
+    mitre_tactics:
+      - TA0008  # Lateral Movement
+    group_by:
+      - subject.ip
+    conditions:
+      enrich.classification.is_internal_traffic: true
+    threshold:
+      count:
+        gte: 15
+    response:
+      - Isolate source immediately
+      - Assume active breach in progress
+      - Check for ransomware or worm activity
+      - Review all accessed systems for compromise
+
+  # ============================================================================
+  # Category 5: Data Exfiltration
+  # ============================================================================
+
+  - id: EXFIL-001
+    name: High-Volume Data Transfer
+    type: single
+    category: data_exfiltration
+    severity: high
+    description: Unusually large outbound data transfer
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0010  # Exfiltration
+    conditions:
+      AND:
+        - enrich.classification.is_external_outbound: true
+        - enrich.counters.src_ip_5m:
+            gte: 100
+        - enrich.geo.cross_border: true
+    response:
+      - Identify data being transferred
+      - Check DLP (Data Loss Prevention) alerts
+      - Verify user authorization for data access
+      - Review recent file access logs
+      - Consider blocking transfer if suspicious
+
+  - id: EXFIL-002
+    name: After-Hours Data Exfiltration
+    type: single
+    category: data_exfiltration
+    severity: high
+    description: Large data transfer outside business hours
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0010  # Exfiltration
+    conditions:
+      AND:
+        - enrich.classification.is_external_outbound: true
+        - enrich.temporal.is_after_hours: true
+        - enrich.counters.src_ip_5m:
+            gte: 50
+        - enrich.geo.cross_border: true
+    response:
+      - Alert on-call security team immediately
+      - Identify source user and accessed data
+      - Check for unauthorized access to sensitive files
+      - Consider blocking egress temporarily
+      - Investigate for insider threat or compromise
+
+  - id: EXFIL-003
+    name: Cloud Storage Upload
+    type: single
+    category: data_exfiltration
+    severity: medium
+    description: Upload to public cloud storage service
+    enabled: true
+    false_positive_rate: high
+    mitre_tactics:
+      - TA0010  # Exfiltration
+    conditions:
+      AND:
+        - enrich.network_intel.dest_provider:
+            in: ["aws", "google", "azure"]
+        - enrich.classification.is_external_outbound: true
+        - enrich.counters.src_ip_5m:
+            gte: 20
+    response:
+      - Verify if authorized cloud service usage
+      - Check against approved cloud services list
+      - Review data being uploaded
+      - Ensure DLP policies are applied
+
+  # ============================================================================
+  # Category 6: Impossible Travel
+  # ============================================================================
+
+  - id: TRAVEL-001
+    name: Impossible Geographic Travel
+    type: single
+    category: account_compromise
+    severity: critical
+    description: User authentication from impossible geographic locations
+    enabled: true
+    false_positive_rate: very_low
+    mitre_tactics:
+      - TA0001  # Initial Access
+      - TA0006  # Credential Access
+    conditions:
+      enrich.anomalies.is_impossible_travel: true
+    response:
+      - Assume account compromise - lock account
+      - Force logout of all active sessions
+      - Require password reset + MFA enrollment
+      - Review all activity since first suspicious login
+      - Check for privilege escalation or data access
+
+  - id: TRAVEL-002
+    name: Cross-Continent Authentication
+    type: single
+    category: account_compromise
+    severity: high
+    description: Authentication from distant geographic location
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0001  # Initial Access
+    conditions:
+      AND:
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.geo.cross_continent: true
+        - enrich.geo.distance_km:
+            gte: 5000
+    response:
+      - Verify with user via out-of-band communication
+      - Check for VPN or proxy usage
+      - Review session activity for suspicious behavior
+      - Consider requiring step-up authentication
+
+  # ============================================================================
+  # Category 7: High-Risk Score Events
+  # ============================================================================
+
+  - id: RISK-001
+    name: Critical Risk Score Event
+    type: single
+    category: high_risk
+    severity: critical
+    description: Event with very high computed risk score
+    enabled: true
+    false_positive_rate: low
+    mitre_tactics:
+      - TA0001  # Initial Access (generic)
+    conditions:
+      AND:
+        - enrich.risk_score:
+            gte: 80
+        - enrich.anomalies.anomaly_count:
+            gte: 3
+    response:
+      - Review all contributing risk factors
+      - Correlate with other security events
+      - Escalate to senior security analyst
+      - Consider immediate containment measures
+
+  - id: RISK-002
+    name: Sustained High-Risk Activity
+    type: aggregation
+    category: high_risk
+    severity: high
+    description: Multiple high-risk events from same source
+    enabled: true
+    false_positive_rate: low
+    time_window: 900  # 15 minutes
+    mitre_tactics:
+      - TA0001  # Initial Access
+    group_by:
+      - subject.ip
+    conditions:
+      enrich.risk_score:
+        gte: 60
+    threshold:
+      count:
+        gte: 5
+    response:
+      - Assume active attack or compromise
+      - Block source IP if external
+      - Isolate host if internal
+      - Begin incident response procedure
+
+  # ============================================================================
+  # Category 8: Protocol & Application Anomalies
+  # ============================================================================
+
+  - id: PROTO-001
+    name: Suspicious Protocol Usage
+    type: single
+    category: anomaly
+    severity: medium
+    description: Unexpected protocol for destination port
+    enabled: false  # Disabled - tune for your environment
+    false_positive_rate: high
+    mitre_tactics:
+      - TA0011  # Command and Control
+    conditions:
+      AND:
+        - enrich.normalization.protocol: tcp
+        - object.port:
+            not_in: [80, 443, 22, 21, 25, 53, 110, 143, 3389]
+        - enrich.classification.is_external_outbound: true
+    response:
+      - Identify application using unusual port
+      - Check if legitimate business application
+      - Review for tunneling or C2 communication
+
+  # ============================================================================
+  # Category 9: After-Hours Activity
+  # ============================================================================
+
+  - id: HOURS-001
+    name: After-Hours Administrative Activity
+    type: single
+    category: policy_violation
+    severity: medium
+    description: Administrative actions outside business hours
+    enabled: true
+    false_positive_rate: medium
+    mitre_tactics:
+      - TA0003  # Persistence
+    conditions:
+      AND:
+        - enrich.temporal.is_after_hours: true
+        - enrich.flags.is_auth_event: true
+        - enrich.normalization.action: allowed
+        - enrich.classification.is_internal_traffic: false
+    response:
+      - Verify authorized after-hours work
+      - Check if on-call or emergency maintenance
+      - Review actions taken during session
+      - Ensure MFA was used for authentication
+
+  # ============================================================================
+  # Category 10: Compliance & Policy
+  # ============================================================================
+
+  - id: POLICY-001
+    name: Cross-Border Data Transfer
+    type: single
+    category: compliance
+    severity: medium
+    description: Data transfer to different country (GDPR/regulatory concern)
+    enabled: true
+    false_positive_rate: high
+    mitre_tactics: []
+    conditions:
+      AND:
+        - enrich.geo.cross_border: true
+        - enrich.classification.is_external_outbound: true
+        - enrich.counters.src_ip_5m:
+            gte: 10
+    response:
+      - Verify compliance with data sovereignty laws
+      - Check for appropriate data protection measures
+      - Review against approved international transfers
+      - Ensure encryption and contracts in place
+
+# Rule metadata
+metadata:
+  version: "1.0"
+  last_updated: "2026-02-06"
+  total_rules: 24
+  rule_categories:
+    - threat_intelligence
+    - authentication
+    - reconnaissance
+    - lateral_movement
+    - data_exfiltration
+    - account_compromise
+    - high_risk
+    - anomaly
+    - policy_violation
+    - compliance
