@@ -263,12 +263,26 @@ def extract_port(data: Dict[str, Any], *key_patterns: str) -> Optional[int]:
     return None
 
 
+_INVALID_USERNAMES = frozenset({
+    '/', '-', '.', '*', '(', ')', 'none', 'null', 'n/a', 'unknown', '',
+    'system', 'local service', 'network service',
+    # Windows service accounts
+    'nt authority\\system', 'nt authority\\local service',
+    'nt authority\\network service', 'nt authority\\anonymous logon',
+    'nt authority\\iusr',
+})
+
+
 def extract_user(data: Dict[str, Any], *key_patterns: str) -> Optional[str]:
     """Extract username from candidate keys."""
     for pattern in key_patterns:
         val = deep_search(data, pattern)
-        if val and isinstance(val, str) and val.strip():
-            return val.strip()
+        if val and isinstance(val, str):
+            # Normalize escaped backslashes and strip quotes
+            cleaned = val.replace('\\\\', '\\')
+            cleaned = cleaned.strip().strip('"').strip("'").strip()
+            if cleaned and cleaned.lower() not in _INVALID_USERNAMES:
+                return cleaned
     return None
 
 
@@ -396,19 +410,119 @@ def extract_host(alert: Dict[str, Any]) -> Dict[str, Any]:
 # ENTITY EXTRACTION
 # ============================================================================
 
+def _extract_ips_from_log(full_log: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract source and destination IPs from raw log text as a last resort."""
+    if not full_log:
+        return None, None
+
+    # Pattern: "from <IP>" is almost always source IP in auth logs
+    from_match = re.search(r'\bfrom\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
+    src_ip = from_match.group(1) if from_match else None
+
+    # Pattern: "to <IP>" or "on <IP>" is often destination
+    to_match = re.search(r'\b(?:to|on)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
+    dst_ip = to_match.group(1) if to_match else None
+
+    # Fallback: collect all IPs in order (first=src, second=dst)
+    if not src_ip:
+        all_ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
+        # Filter out broadcast/loopback
+        all_ips = [ip for ip in all_ips if not ip.startswith(('0.', '255.', '127.0.0.'))]
+        if all_ips:
+            src_ip = all_ips[0]
+            if len(all_ips) > 1 and not dst_ip:
+                dst_ip = all_ips[1]
+
+    return src_ip, dst_ip
+
+
+def _extract_user_from_log(full_log: str) -> Tuple[Optional[str], Optional[str]]:
+    """Extract source and target users from raw log text as a last resort."""
+    if not full_log:
+        return None, None
+
+    src_user = None
+    dst_user = None
+
+    # "Failed password for <user> from ..."
+    m = re.search(r'(?:Failed|Accepted)\s+\w+\s+for\s+(invalid\s+user\s+)?(\S+)\s+from', full_log)
+    if m:
+        dst_user = m.group(2)
+
+    # "Invalid user <user> from ..."
+    if not dst_user:
+        m = re.search(r'[Ii]nvalid\s+user\s+(\S+)\s+from', full_log)
+        if m:
+            dst_user = m.group(1)
+
+    # "user=<user>" or "user:<user>"
+    if not src_user:
+        m = re.search(r'\buser[=:](\S+)', full_log, re.IGNORECASE)
+        if m:
+            src_user = m.group(1)
+
+    # Validate extracted usernames against invalid list
+    if src_user:
+        cleaned = src_user.strip().strip('"').strip("'").strip()
+        src_user = cleaned if cleaned and cleaned.lower() not in _INVALID_USERNAMES else None
+    if dst_user:
+        cleaned = dst_user.strip().strip('"').strip("'").strip()
+        dst_user = cleaned if cleaned and cleaned.lower() not in _INVALID_USERNAMES else None
+
+    return src_user, dst_user
+
+
 def extract_entities(alert: Dict[str, Any]) -> Tuple[Dict, Dict]:
     """Extract subject (initiator) and object (target) entities."""
     data = alert.get('data', {})
-    
-    # Source/Subject
-    src_ip = extract_ip(data, 'src_ip', 'srcip', 'source_ip', 'client_ip', 'saddr', 'src', 'srcaddr', 'SourceAddress', 'ClientIP')
+
+    # Source/Subject — search data first with extended patterns
+    src_ip = extract_ip(data,
+        'src_ip', 'srcip', 'source_ip', 'client_ip', 'saddr', 'src', 'srcaddr',
+        'SourceAddress', 'ClientIP',
+        'IpAddress', 'SourceNetworkAddress', 'CallerIPAddress',
+        'ipAddress', 'remote_ip', 'remoteAddress', 'remote_addr',
+        'peer_address', 'clientip', 'attacker_ip')
     src_port = extract_port(data, 'src_port', 'srcport', 'sport', 'source_port', 'SourcePort')
-    src_user = extract_user(data, 'user', 'username', 'srcuser', 'SubjectUserName', 'UserName', 'Account', 'SourceUserName')
-    
-    # Destination/Object
-    dst_ip = extract_ip(data, 'dest_ip', 'dstip', 'destination_ip', 'server_ip', 'daddr', 'dst', 'dstaddr', 'DestinationAddress', 'TargetIP')
+    src_user = extract_user(data,
+        'user', 'username', 'srcuser', 'SubjectUserName', 'UserName',
+        'Account', 'SourceUserName',
+        'loginUser', 'login_user', 'auth_user', 'caller_user')
+
+    # Destination/Object — extended patterns
+    dst_ip = extract_ip(data,
+        'dest_ip', 'dstip', 'destination_ip', 'server_ip', 'daddr', 'dst', 'dstaddr',
+        'DestinationAddress', 'TargetIP',
+        'DestinationNetworkAddress', 'target_ip', 'targetip', 'server_address')
     dst_port = extract_port(data, 'dest_port', 'dstport', 'dport', 'destination_port', 'DestinationPort')
-    dst_user = extract_user(data, 'dstuser', 'targetUserName', 'TargetUserName', 'DestinationUserName')
+    dst_user = extract_user(data,
+        'dstuser', 'targetUserName', 'TargetUserName', 'DestinationUserName',
+        'target_user', 'targetuser')
+
+    # Fallback: search entire alert object (covers fields outside data, e.g. Wazuh root-level)
+    if not src_ip:
+        src_ip = extract_ip(alert, 'srcip', 'src_ip', 'source_ip', 'IpAddress', 'SourceNetworkAddress')
+    if not dst_ip:
+        dst_ip = extract_ip(alert, 'dstip', 'dest_ip', 'destination_ip', 'DestinationAddress')
+    if not src_user:
+        src_user = extract_user(alert, 'srcuser', 'user', 'username')
+    if not dst_user:
+        dst_user = extract_user(alert, 'dstuser', 'TargetUserName', 'targetUserName')
+
+    # Last resort: parse raw log text for IPs and users
+    full_log = alert.get('full_log', '')
+    if not src_ip or not dst_ip:
+        log_src, log_dst = _extract_ips_from_log(full_log)
+        if not src_ip:
+            src_ip = log_src
+        if not dst_ip:
+            dst_ip = log_dst
+    if not src_user or not dst_user:
+        log_src_user, log_dst_user = _extract_user_from_log(full_log)
+        if not src_user:
+            src_user = log_src_user
+        if not dst_user:
+            dst_user = log_dst_user
     
     # Object name (file, process, service, etc.)
     obj_name = safe_get(data,
@@ -883,6 +997,8 @@ def main():
     parser.add_argument('--window-minutes', type=int, default=5)
     parser.add_argument('--poll-interval', type=float, default=0.5)
     parser.add_argument('--state-file', default='./wazuh_normalizer.state')
+    parser.add_argument('--follow', action='store_true',
+                        help='Continuously follow input file for new data')
     
     args = parser.parse_args()
     
@@ -903,14 +1019,27 @@ def main():
     
     # Open output
     output_file = open(args.output, 'a', encoding='utf-8')
-    
+
     print("Scanning existing alerts...")
     processed = 0
+    follow_count = 0
     tailer = FileTailer(args.input, args.poll_interval)
-    
+
     try:
         # Phase 1: Scan existing
         tailer.open()
+
+        # Resume from saved state if available
+        saved_pos, saved_inode = load_state(args.state_file)
+        if saved_pos is not None and saved_inode is not None and tailer.file:
+            current_inode = tailer.inode
+            if current_inode == saved_inode:
+                file_size = os.fstat(tailer.file.fileno()).st_size
+                seek_to = min(saved_pos, file_size)
+                tailer.file.seek(seek_to)
+                tailer.position = seek_to
+                print(f"  Resumed from saved position {seek_to}")
+
         if tailer.file:
             while True:
                 alerts = tailer.read_chunk()
@@ -935,27 +1064,31 @@ def main():
                             print(f"  Processed {processed}...")
         
         print(f"Scan complete: {processed} events")
-        print("Following new alerts...")
-        
-        # Phase 2: Follow mode
+
+        # Phase 2: Follow mode (only with --follow)
         follow_count = 0
         save_counter = 0
-        
-        while True:
-            alerts = tailer.read_chunk()
-            for alert in alerts:
-                event_time = extract_event_time(alert)
-                if event_time >= window_start:
-                    normalized = normalize_alert(alert)
-                    output_file.write(json.dumps(normalized, separators=(',', ':'), ensure_ascii=False) + '\n')
-                    output_file.flush()
-                    follow_count += 1
-                    save_counter += 1
-                    
-                    if save_counter >= 10:
-                        save_state(args.state_file, tailer.position, tailer.inode)
-                        save_counter = 0
-    
+
+        if args.follow:
+            print("Following new alerts...")
+
+            while True:
+                alerts = tailer.read_chunk()
+                for alert in alerts:
+                    event_time = extract_event_time(alert)
+                    if event_time >= window_start:
+                        normalized = normalize_alert(alert)
+                        output_file.write(json.dumps(normalized, separators=(',', ':'), ensure_ascii=False) + '\n')
+                        output_file.flush()
+                        follow_count += 1
+                        save_counter += 1
+
+                        if save_counter >= 10:
+                            save_state(args.state_file, tailer.position, tailer.inode)
+                            save_counter = 0
+        else:
+            print("Batch mode complete (use --follow for continuous mode)")
+
     except KeyboardInterrupt:
         print("\nShutting down...")
     finally:

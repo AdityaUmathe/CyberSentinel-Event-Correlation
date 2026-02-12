@@ -652,7 +652,7 @@ class LogEnricher:
         protocol = network.get("protocol")
         
         # Handle missing protocol - default to "unknown" to prevent None errors
-        if protocol is None:
+        if not protocol:
             protocol = "unknown"
         
         # Temporal
@@ -762,9 +762,15 @@ class LogEnricher:
             network_intel_data["quic"] = quic_data
         else:
             # Explicitly show QUIC was checked but not detected
+            if not protocol or protocol == "unknown":
+                quic_reason = "no_protocol"
+            elif protocol.upper() not in ["UDP", "17"] or dest_port != 443:
+                quic_reason = "not_udp_443"
+            else:
+                quic_reason = "criteria_not_met"
             network_intel_data["quic"] = {
                 "is_quic": False,
-                "reason": "not_udp_443" if (protocol and protocol.upper() not in ["UDP", "17"]) or dest_port != 443 else "criteria_not_met"
+                "reason": quic_reason
             }
         
         # GeoIP lookup
@@ -785,17 +791,22 @@ class LogEnricher:
                     geo_section["dest"] = dest_geo
                 
                 if src_geo and dest_geo:
-                    distance = self.geo_tracker._calculate_distance(
-                        src_geo["latitude"], src_geo["longitude"],
-                        dest_geo["latitude"], dest_geo["longitude"]
-                    )
-                    geo_section["distance_km"] = round(distance, 2)
-                    geo_section["same_country"] = src_geo["country_code"] == dest_geo["country_code"]
-                    geo_section["cross_border"] = src_geo["country_code"] != dest_geo["country_code"]
-                    geo_section["cross_continent"] = distance > 3000
+                    # Only calculate distance if both locations have coordinates
+                    if (src_geo.get("latitude") is not None and src_geo.get("longitude") is not None and
+                        dest_geo.get("latitude") is not None and dest_geo.get("longitude") is not None):
+                        distance = self.geo_tracker._calculate_distance(
+                            src_geo["latitude"], src_geo["longitude"],
+                            dest_geo["latitude"], dest_geo["longitude"]
+                        )
+                        geo_section["distance_km"] = round(distance, 2)
+                        geo_section["cross_continent"] = distance > 3000
+                    
+                    # Country comparison can be done even without coordinates
+                    geo_section["same_country"] = src_geo.get("country_code") == dest_geo.get("country_code")
+                    geo_section["cross_border"] = src_geo.get("country_code") != dest_geo.get("country_code")
                 
                 tracking_key = subject.get("name") or src_ip
-                if tracking_key and src_geo:
+                if tracking_key and src_geo and src_geo.get("latitude") is not None and src_geo.get("longitude") is not None:
                     impossible_travel_data = self.geo_tracker.update_location(
                         tracking_key,
                         src_geo["country"],
@@ -942,6 +953,12 @@ def main():
     parser.add_argument("--asn-db", help="Path to GeoLite2-ASN.mmdb")
     parser.add_argument("--tor-list", help="Path to tor-exit-nodes.txt")
     parser.add_argument("--reputation-db", help="Path to malicious-ips.txt")
+    parser.add_argument("--follow", action="store_true",
+                        help="Continuously tail input file for new data")
+    parser.add_argument("--state-file", default=".state/enricher.state",
+                        help="State file for follow mode position tracking")
+    parser.add_argument("--poll-interval", type=float, default=0.5,
+                        help="Poll interval in seconds for follow mode")
     
     args = parser.parse_args()
     
@@ -959,42 +976,73 @@ def main():
         reputation_db_path=args.reputation_db
     )
     
-    try:
-        with open(args.input, "r", encoding="utf-8") as infile, \
-             open(args.output, "w", encoding="utf-8") as outfile:
-            
-            line_count = 0
-            for line in infile:
-                enriched_line = enricher.process_line(line)
-                if enriched_line:
-                    outfile.write(enriched_line + "\n")
+    if args.follow:
+        # --- Streaming / follow mode ---
+        from file_tailer import JSONLTailer, append_jsonl
+
+        tailer = JSONLTailer(
+            args.input,
+            state_file=args.state_file,
+            poll_interval=args.poll_interval,
+        )
+        line_count = 0
+        try:
+            outfile = open(args.output, "a", encoding="utf-8")
+            print(f"Following {args.input} -> {args.output} ...", file=sys.stderr)
+
+            for event in tailer.follow():
+                enriched = enricher.enrich_event(event)
+                if enriched:
+                    append_jsonl(outfile, enriched)
                     line_count += 1
-        
-        print(f"\n✓ Network enrichment complete: {line_count} events processed", file=sys.stderr)
-        print(f"  Input:  {args.input}", file=sys.stderr)
-        print(f"  Output: {args.output}", file=sys.stderr)
-        
-        features = []
-        if args.geoip_db:
-            features.append("GeoIP")
-        if args.asn_db:
-            features.append("ASN")
-        if args.tor_list:
-            features.append("Tor Detection")
-        if args.reputation_db:
-            features.append("IP Reputation")
-        
-        if features:
-            print(f"  Features: {', '.join(features)}", file=sys.stderr)
-        
-    except FileNotFoundError as e:
-        print(f"✗ Error: File not found: {e}", file=sys.stderr)
-        sys.exit(1)
-    except IOError as e:
-        print(f"✗ Error: {e}", file=sys.stderr)
-        sys.exit(1)
-    finally:
-        enricher.close()
+                    if line_count % 500 == 0:
+                        print(f"  Enriched {line_count} events...", file=sys.stderr)
+
+        except KeyboardInterrupt:
+            print("\nShutting down enricher...", file=sys.stderr)
+        finally:
+            tailer.close()
+            outfile.close()
+            enricher.close()
+            print(f"✓ Enriched {line_count} events (follow mode)", file=sys.stderr)
+    else:
+        # --- Batch mode (original behaviour) ---
+        try:
+            with open(args.input, "r", encoding="utf-8") as infile, \
+                 open(args.output, "w", encoding="utf-8") as outfile:
+
+                line_count = 0
+                for line in infile:
+                    enriched_line = enricher.process_line(line)
+                    if enriched_line:
+                        outfile.write(enriched_line + "\n")
+                        line_count += 1
+
+            print(f"\n✓ Network enrichment complete: {line_count} events processed", file=sys.stderr)
+            print(f"  Input:  {args.input}", file=sys.stderr)
+            print(f"  Output: {args.output}", file=sys.stderr)
+
+            features = []
+            if args.geoip_db:
+                features.append("GeoIP")
+            if args.asn_db:
+                features.append("ASN")
+            if args.tor_list:
+                features.append("Tor Detection")
+            if args.reputation_db:
+                features.append("IP Reputation")
+
+            if features:
+                print(f"  Features: {', '.join(features)}", file=sys.stderr)
+
+        except FileNotFoundError as e:
+            print(f"✗ Error: File not found: {e}", file=sys.stderr)
+            sys.exit(1)
+        except IOError as e:
+            print(f"✗ Error: {e}", file=sys.stderr)
+            sys.exit(1)
+        finally:
+            enricher.close()
 
 
 if __name__ == "__main__":

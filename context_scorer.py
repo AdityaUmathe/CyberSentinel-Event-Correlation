@@ -136,32 +136,37 @@ class BusinessImpactCalculator:
             }
         }
     
+    # Fallback scores when config doesn't define a category
+    _DEFAULT_CATEGORY_SCORES = {
+        "threat_intelligence": 70,
+        "authentication": 60,
+        "reconnaissance": 40,
+        "lateral_movement": 80,
+        "data_exfiltration": 90,
+        "account_compromise": 85,
+        "high_risk": 75,
+        "anomaly": 30,
+        "policy_violation": 20,
+        "compliance": 25,
+    }
+
     def _get_base_impact(self, category: str, criticality: str) -> int:
-        """Get base impact from category and criticality matrix."""
-        category_scores = {
-            "threat_intelligence": 70,
-            "authentication": 60,
-            "reconnaissance": 40,
-            "lateral_movement": 80,
-            "data_exfiltration": 90,
-            "account_compromise": 85,
-            "high_risk": 75,
-            "anomaly": 30,
-            "policy_violation": 20,
-            "compliance": 25
-        }
-        
+        """Get base impact from config matrix, with hardcoded fallback."""
+        # Prefer config impact_matrix if the category is defined there
+        matrix_entry = self.impact_matrix.get(category)
+        if matrix_entry and criticality in matrix_entry:
+            return min(int(matrix_entry[criticality]), 100)
+
+        # Fallback to hardcoded base * criticality multiplier
         criticality_multipliers = {
             "critical": 1.3,
             "high": 1.1,
             "medium": 1.0,
-            "low": 0.8
+            "low": 0.8,
         }
-        
-        base = category_scores.get(category, 50)
+        base = self._DEFAULT_CATEGORY_SCORES.get(category, 50)
         multiplier = criticality_multipliers.get(criticality, 1.0)
-        
-        return int(base * multiplier)
+        return min(int(base * multiplier), 100)
     
     def _get_impact_level(self, score: int) -> str:
         """Convert impact score to level."""
@@ -312,7 +317,58 @@ class ContextScoringEngine:
         }
         
         self.scored_incidents.append(scored_incident)
-    
+
+    def process_incident_streaming(self, incident: Dict[str, Any]) -> Dict[str, Any]:
+        """Process and score an incident, returning the scored result directly.
+        Does NOT accumulate in memory — caller writes to disk."""
+        # Extract from correlation incident structure (alerts[], affected_entities)
+        event = incident.get("event", {})
+        entities = incident.get("affected_entities", {})
+        alerts_list = incident.get("alerts", [])
+        first_alert = alerts_list[0] if alerts_list else {}
+        attack_chain = incident.get("attack_chain", {})
+
+        host_id = (event.get("host", {}).get("id")
+                   or (entities.get("affected_hosts", [None])[0] if entities.get("affected_hosts") else None))
+        host_ip = event.get("host", {}).get("ip")
+        username = (event.get("subject", {}).get("name")
+                    or first_alert.get("user")
+                    or (entities.get("affected_users", [None])[0] if entities.get("affected_users") else None))
+
+        asset_ctx = self.asset_context.get_asset_criticality(host_id, host_ip)
+        user_ctx = self.asset_context.get_user_context(username)
+
+        # Build a synthetic "rule" dict so the impact calculator can find
+        # category, severity, and MITRE tactics from the correlation incident.
+        if not incident.get("rule"):
+            incident = dict(incident)
+            incident["rule"] = {
+                "category": first_alert.get("category") or "other",
+                "severity": incident.get("severity") or first_alert.get("severity") or "medium",
+                "mitre_tactics": attack_chain.get("tactics", []),
+            }
+
+        impact_analysis = self.impact_calculator.calculate_impact(incident, asset_ctx, user_ctx)
+        priority_analysis = self.priority_scorer.calculate_priority(incident, impact_analysis)
+
+        scored_incident = {
+            "scored_at": datetime.utcnow().isoformat() + "Z",
+            "alert_id": incident.get("alert_id") or incident.get("incident_id"),
+            "original_incident": incident,
+            "context": {
+                "asset": asset_ctx,
+                "user": user_ctx
+            },
+            "impact_analysis": impact_analysis,
+            "priority": priority_analysis,
+            "recommended_actions": self._generate_actions(
+                incident, impact_analysis, priority_analysis
+            )
+        }
+
+        # Don't accumulate — already written to disk by caller
+        return scored_incident
+
     def _generate_actions(
         self,
         incident: Dict[str, Any],
@@ -387,6 +443,12 @@ def main():
     parser.add_argument("--output", default="scored_incidents.jsonl", help="Output scored incidents (JSONL)")
     parser.add_argument("--config", default="context_config.yaml", help="Context configuration (YAML)")
     parser.add_argument("--stats", action="store_true", help="Print statistics")
+    parser.add_argument("--follow", action="store_true",
+                        help="Continuously tail input file for new data")
+    parser.add_argument("--state-file", default=".state/scorer.state",
+                        help="State file for follow mode position tracking")
+    parser.add_argument("--poll-interval", type=float, default=0.5,
+                        help="Poll interval in seconds for follow mode")
     
     args = parser.parse_args()
     
@@ -406,42 +468,70 @@ def main():
     # Initialize engine
     engine = ContextScoringEngine(config)
     
-    # Process incidents
-    print(f"Processing incidents from {args.input}...", file=sys.stderr)
-    incident_count = 0
-    
-    try:
-        with open(args.input, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                try:
-                    incident = json.loads(line)
-                    engine.process_incident(incident)
-                    incident_count += 1
-                
-                except json.JSONDecodeError:
-                    continue
-        
-        print(f"✓ Processed {incident_count} incidents", file=sys.stderr)
-    
-    except FileNotFoundError:
-        print(f"✗ Error: Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-    
-    # Get scored incidents
-    scored = engine.get_scored_incidents()
-    
-    # Write output
-    print(f"Writing scored incidents to {args.output}...", file=sys.stderr)
-    with open(args.output, 'w') as f:
-        for incident in scored:
-            f.write(json.dumps(incident, separators=(",", ":"), ensure_ascii=False) + "\n")
-    
-    print(f"✓ Generated {len(scored)} scored incidents", file=sys.stderr)
-    
+    if args.follow:
+        # --- Streaming / follow mode ---
+        from file_tailer import JSONLTailer, append_jsonl
+
+        tailer = JSONLTailer(
+            args.input,
+            state_file=args.state_file,
+            poll_interval=args.poll_interval,
+        )
+        incident_count = 0
+        try:
+            outfile = open(args.output, "a", encoding="utf-8")
+            print(f"Following {args.input} -> {args.output} ...", file=sys.stderr)
+
+            for incident in tailer.follow():
+                scored = engine.process_incident_streaming(incident)
+                append_jsonl(outfile, scored)
+                incident_count += 1
+                if incident_count % 100 == 0:
+                    print(f"  Scored {incident_count} incidents...", file=sys.stderr)
+
+        except KeyboardInterrupt:
+            print("\nShutting down scorer...", file=sys.stderr)
+        finally:
+            tailer.close()
+            outfile.close()
+            print(f"✓ Scored {incident_count} incidents (follow mode)", file=sys.stderr)
+    else:
+        # --- Batch mode (original behaviour) ---
+        print(f"Processing incidents from {args.input}...", file=sys.stderr)
+        incident_count = 0
+
+        try:
+            with open(args.input, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        incident = json.loads(line)
+                        engine.process_incident(incident)
+                        incident_count += 1
+
+                    except json.JSONDecodeError:
+                        continue
+
+            print(f"✓ Processed {incident_count} incidents", file=sys.stderr)
+
+        except FileNotFoundError:
+            print(f"✗ Error: Input file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+
+        # Get scored incidents
+        scored = engine.get_scored_incidents()
+
+        # Write output
+        print(f"Writing scored incidents to {args.output}...", file=sys.stderr)
+        with open(args.output, 'w') as f:
+            for incident in scored:
+                f.write(json.dumps(incident, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+        print(f"✓ Generated {len(scored)} scored incidents", file=sys.stderr)
+
     # Print statistics
     if args.stats:
         stats = engine.get_stats()

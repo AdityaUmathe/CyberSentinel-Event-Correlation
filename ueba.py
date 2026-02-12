@@ -12,11 +12,12 @@ Usage:
 
 import argparse
 import json
+import os
 import sys
 import yaml
 from collections import defaultdict, Counter
 from datetime import datetime
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 import statistics
 
 
@@ -213,6 +214,86 @@ class UEBAEngine:
         else:
             return "low"
     
+    def process_event_streaming(self, event: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Process event and return score immediately, or None if no anomaly/still learning."""
+        self.baseline.update(event)
+
+        if self.baseline.learning_complete and self.detector is None:
+            self.detector = AnomalyDetector(self.baseline)
+
+        if not self.baseline.learning_complete:
+            return None
+
+        user = event.get("subject", {}).get("name")
+        if not user:
+            return None
+
+        result = self.detector.detect(event)
+
+        if result.get("anomalies") or result.get("total_score", 0) >= self.min_score_threshold:
+            score = {
+                "timestamp": datetime.utcnow().isoformat() + "Z",
+                "entity": {
+                    "user": user,
+                    "source_ip": event.get("subject", {}).get("ip")
+                },
+                "ueba": {
+                    "score": result["total_score"],
+                    "risk_level": self._get_risk_level(result["total_score"]),
+                    "anomalies": result["anomalies"],
+                    "anomaly_breakdown": result["scores"],
+                    "baseline": result.get("baseline", {})
+                },
+                "event_context": {
+                    "event_id": event.get("event_id"),
+                    "event_time": event.get("event_time"),
+                    "event_category": event.get("event_category"),
+                    "enrichment_risk": event.get("enrich", {}).get("risk_score", 0)
+                }
+            }
+            # Don't accumulate — already written to disk by caller
+            return score
+
+        return None
+
+    def save_baseline(self, filepath: str):
+        """Persist baseline data to JSON for faster restart."""
+        data = {
+            "events_processed": self.baseline.events_processed,
+            "learning_complete": self.baseline.learning_complete,
+            "user_hours": {u: list(h) for u, h in self.baseline.user_hours.items()},
+            "user_countries": {u: list(c) for u, c in self.baseline.user_countries.items()},
+            "user_ips": {u: list(ips) for u, ips in self.baseline.user_ips.items()},
+            "user_days": {u: list(d) for u, d in self.baseline.user_days.items()},
+        }
+        try:
+            os.makedirs(os.path.dirname(filepath) or ".", exist_ok=True)
+            with open(filepath, "w") as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Warning: could not save baseline: {e}", file=sys.stderr)
+
+    def load_baseline(self, filepath: str) -> bool:
+        """Load persisted baseline. Returns True if successfully loaded."""
+        if not os.path.exists(filepath):
+            return False
+        try:
+            with open(filepath, "r") as f:
+                data = json.load(f)
+            self.baseline.events_processed = data["events_processed"]
+            self.baseline.learning_complete = data["learning_complete"]
+            self.baseline.user_hours = defaultdict(list, {u: h for u, h in data["user_hours"].items()})
+            self.baseline.user_countries = defaultdict(set, {u: set(c) for u, c in data["user_countries"].items()})
+            self.baseline.user_ips = defaultdict(set, {u: set(ips) for u, ips in data["user_ips"].items()})
+            self.baseline.user_days = defaultdict(list, {u: d for u, d in data["user_days"].items()})
+            if self.baseline.learning_complete:
+                self.detector = AnomalyDetector(self.baseline)
+            print(f"✓ Loaded baseline ({self.baseline.events_processed} events)", file=sys.stderr)
+            return True
+        except Exception as e:
+            print(f"Warning: could not load baseline: {e}", file=sys.stderr)
+            return False
+
     def get_scores(self) -> List[Dict[str, Any]]:
         """Get all scores."""
         return self.scores
@@ -249,6 +330,14 @@ def main():
     parser.add_argument("--output", default="ueba_scores.jsonl", help="Output UEBA scores")
     parser.add_argument("--config", default="ueba_config.yaml", help="Configuration")
     parser.add_argument("--stats", action="store_true", help="Print statistics")
+    parser.add_argument("--follow", action="store_true",
+                        help="Continuously tail input file for new data")
+    parser.add_argument("--state-file", default=".state/ueba.state",
+                        help="State file for follow mode position tracking")
+    parser.add_argument("--poll-interval", type=float, default=0.5,
+                        help="Poll interval in seconds for follow mode")
+    parser.add_argument("--baseline-file", default=".state/ueba_baseline.json",
+                        help="Persisted baseline file for faster restart")
     
     args = parser.parse_args()
     
@@ -261,43 +350,82 @@ def main():
         config = {"min_score_threshold": 20}
     
     engine = UEBAEngine(config)
-    
-    print(f"Processing events from {args.input}...", file=sys.stderr)
-    event_count = 0
-    
-    try:
-        with open(args.input, 'r') as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                
-                try:
-                    event = json.loads(line)
-                    engine.process_event(event)
-                    event_count += 1
-                    
-                    if event_count % 1000 == 0:
-                        print(f"  Processed {event_count} events...", file=sys.stderr)
-                
-                except json.JSONDecodeError:
-                    continue
-        
-        print(f"✓ Processed {event_count} events", file=sys.stderr)
-    
-    except FileNotFoundError:
-        print(f"✗ Input file not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-    
-    scores = engine.get_scores()
-    
-    print(f"Writing UEBA scores to {args.output}...", file=sys.stderr)
-    with open(args.output, 'w') as f:
-        for score in scores:
-            f.write(json.dumps(score, separators=(",", ":"), ensure_ascii=False) + "\n")
-    
-    print(f"✓ Generated {len(scores)} UEBA scores", file=sys.stderr)
-    
+
+    if args.follow:
+        # --- Streaming / follow mode ---
+        from file_tailer import JSONLTailer, append_jsonl
+
+        # Try to load persisted baseline to skip learning phase
+        engine.load_baseline(args.baseline_file)
+
+        tailer = JSONLTailer(
+            args.input,
+            state_file=args.state_file,
+            poll_interval=args.poll_interval,
+        )
+        event_count = 0
+        score_count = 0
+        try:
+            outfile = open(args.output, "a", encoding="utf-8")
+            print(f"Following {args.input} -> {args.output} ...", file=sys.stderr)
+
+            for event in tailer.follow():
+                score = engine.process_event_streaming(event)
+                event_count += 1
+                if score is not None:
+                    append_jsonl(outfile, score)
+                    score_count += 1
+
+                if event_count % 1000 == 0:
+                    print(f"  Processed {event_count} events, {score_count} scores...",
+                          file=sys.stderr)
+
+        except KeyboardInterrupt:
+            print("\nShutting down UEBA...", file=sys.stderr)
+        finally:
+            engine.save_baseline(args.baseline_file)
+            tailer.close()
+            outfile.close()
+            print(f"✓ Processed {event_count} events, {score_count} scores (follow mode)",
+                  file=sys.stderr)
+    else:
+        # --- Batch mode (original behaviour) ---
+        print(f"Processing events from {args.input}...", file=sys.stderr)
+        event_count = 0
+
+        try:
+            with open(args.input, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+
+                    try:
+                        event = json.loads(line)
+                        engine.process_event(event)
+                        event_count += 1
+
+                        if event_count % 1000 == 0:
+                            print(f"  Processed {event_count} events...", file=sys.stderr)
+
+                    except json.JSONDecodeError:
+                        continue
+
+            print(f"✓ Processed {event_count} events", file=sys.stderr)
+
+        except FileNotFoundError:
+            print(f"✗ Input file not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+
+        scores = engine.get_scores()
+
+        print(f"Writing UEBA scores to {args.output}...", file=sys.stderr)
+        with open(args.output, 'w') as f:
+            for score in scores:
+                f.write(json.dumps(score, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+        print(f"✓ Generated {len(scores)} UEBA scores", file=sys.stderr)
+
     if args.stats:
         stats = engine.get_stats()
         print("\n" + "="*60, file=sys.stderr)
@@ -306,19 +434,19 @@ def main():
         print(f"Events Processed: {stats['events_processed']}", file=sys.stderr)
         print(f"Learning Complete: {stats['learning_complete']}", file=sys.stderr)
         print(f"Total Scores: {stats['total_scores']}", file=sys.stderr)
-        
+
         if stats['total_scores'] > 0:
             print(f"\nScore Stats:", file=sys.stderr)
             print(f"  Min: {stats['score_stats']['min']}", file=sys.stderr)
             print(f"  Max: {stats['score_stats']['max']}", file=sys.stderr)
             print(f"  Avg: {stats['score_stats']['avg']:.2f}", file=sys.stderr)
-            
+
             print(f"\nBy Risk Level:", file=sys.stderr)
             for level, count in sorted(stats['by_risk_level'].items()):
                 print(f"  {level}: {count}", file=sys.stderr)
-            
+
             print(f"\nUnique Users: {stats['unique_users']}", file=sys.stderr)
-        
+
         print("="*60, file=sys.stderr)
 
 
