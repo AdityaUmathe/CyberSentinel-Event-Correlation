@@ -1,6 +1,6 @@
 # CyberSentinel Event Correlation Engine
 
-A multi-stage SIEM event correlation pipeline that ingests raw Wazuh security alerts and produces prioritized, UEBA-enriched security incidents with full traceability back to the original log events.
+A multi-stage SIEM event correlation pipeline that ingests raw Wazuh security alerts and produces prioritized, context-enriched security incidents with full traceability back to the original log events.
 
 Built for SOC teams that need correlated, deduplicated, and business-context-aware incident output from high-volume Wazuh deployments.
 
@@ -13,21 +13,9 @@ Raw Wazuh Alerts (alerts.json)
          |
    [L2: Enricher]             -->  enriched.jsonl
          |
-         +--------------------------+
-         |                          |
-   [L3: Correlation Engine]   [L5: UEBA Engine]
-         |                          |
-   incidents.jsonl             ueba_scores.jsonl
-         |                          |
-   [L4: Context Scorer]            |
-         |                          |
-   scored_incidents.jsonl           |
-         |                          |
-         +------------+-------------+
-                      |
-               [FUSION Engine]
-                      |
-            correlated_UEBA_alerts.jsonl   (final output)
+   [L3: Correlation Engine]   -->  incidents.jsonl
+         |
+   [L4: Context Scorer]       -->  scored_incidents.jsonl   (final output)
 ```
 
 | Layer | Script | Purpose |
@@ -36,10 +24,8 @@ Raw Wazuh Alerts (alerts.json)
 | L2 | `enrich_json.py` | Adds GeoIP, ASN, Tor detection, IP reputation, behavioral counters, anomaly flags, risk scores |
 | L3 | `unified_correlation_engine.py` | Rule-based detection with trigger-point correlation per source IP |
 | L4 | `context_scorer.py` | Business impact scoring with asset criticality and SLA assignment |
-| L5 | `ueba.py` | User and Entity Behavior Analytics with baseline learning |
-| FUSION | `fusion.py` | Combines L4 scored incidents with L5 UEBA scores into final actionable alerts |
 
-L3 and L5 read from `enriched.jsonl` independently and run in parallel. Shared module `file_tailer.py` provides JSONL tailing with state persistence for streaming mode.
+Shared module `file_tailer.py` provides JSONL tailing with state persistence for streaming mode.
 
 ## Features
 
@@ -48,9 +34,7 @@ L3 and L5 read from `enriched.jsonl` independently and run in parallel. Shared m
 - **Trigger-point correlation** -- recurring 5min / 30min / 24hr intervals per source IP, grouping related alerts into incidents
 - **Offline enrichment** -- GeoIP, ASN, cloud provider detection, Tor exit nodes, IP reputation using free local databases only (no external API calls)
 - **Impossible travel detection** -- Haversine-based geographic analysis with VPN/proxy false-positive filtering
-- **UEBA behavioral baselines** -- per-user learning of typical hours, countries, IPs, and activity patterns
 - **Business context scoring** -- asset criticality, user privilege levels, impact matrices, and SLA assignment (P1-P4)
-- **Fusion layer** -- combines rule-based correlation with behavioral analytics for final risk assessment
 - **State persistence** -- all streaming processes resume from last position after restart
 - **Wazuh traceability** -- correlated incidents include `original_event_id`, `original_signature_id`, `original_signature`, and `original_action` fields linking back to raw Wazuh events
 - **Graceful shutdown** -- SIGINT/SIGTERM handling with phased process termination
@@ -63,7 +47,7 @@ L3 and L5 read from `enriched.jsonl` independently and run in parallel. Shared m
 pip install pyyaml geoip2
 ```
 
-- `pyyaml` -- required by L3, L4, L5, and FUSION for reading YAML configuration
+- `pyyaml` -- required by L3 and L4 for reading YAML configuration
 - `geoip2` -- optional, only needed for GeoIP/ASN enrichment in L2
 
 ### Databases (optional, for full enrichment)
@@ -95,8 +79,6 @@ python3 pipeline.py --input /var/ossec/logs/alerts/alerts.json --all
 # Or run in continuous streaming mode
 python3 pipeline.py --input /var/ossec/logs/alerts/alerts.json --all --follow
 ```
-
-The pipeline orchestrator runs L1 through L4. For the full 6-stage pipeline including UEBA and Fusion, run L5 and FUSION separately (see below).
 
 ## Usage
 
@@ -146,14 +128,6 @@ python3 unified_correlation_engine.py --input enriched.jsonl --output incidents.
 # L4 -- Score with business context
 python3 context_scorer.py --input incidents.jsonl --output scored_incidents.jsonl \
     --config context_config.yaml
-
-# L5 -- UEBA behavioral analysis (runs independently from enriched.jsonl)
-python3 ueba.py --input enriched.jsonl --output ueba_scores.jsonl \
-    --config ueba_config.yaml
-
-# FUSION -- Combine scored incidents with UEBA scores
-python3 fusion.py --incidents scored_incidents.jsonl --ueba ueba_scores.jsonl \
-    --output correlated_UEBA_alerts.jsonl
 ```
 
 All scripts support `--follow` for continuous streaming mode, and `--stats` for statistics output (where applicable).
@@ -223,36 +197,7 @@ Enriches incidents with business context and calculates final priority scores.
 - **User context** -- privilege level, department, is_privileged flag
 - **Impact scoring** -- category-specific impact matrix with modifiers for privileged users (+20), sensitive data (+15), critical business unit (+10), multi-tactic attack (+10)
 - **Priority formula:** `priority_score = severity_score * 0.4 + impact_score * 0.6`
-
-### L5: UEBA Engine (`ueba.py`)
-
-Builds per-user behavioral baselines and detects deviations.
-
-- **Baseline learning** -- tracks typical hours, countries, source IPs, and days of week per user
-- **Anomaly detection** with weighted scores:
-
-| Anomaly Type | Score |
-|-------------|-------|
-| Malicious IP contact | 50 |
-| Impossible travel | 45 |
-| Tor usage | 40 |
-| First-time country | 35 |
-| Unusual hour | 25 |
-| First-time IP | 20 |
-| After-hours anomaly | 20 |
-| Unusual weekend activity | 15 |
-
-- **Baseline persistence** -- saves/loads baseline profiles to `.state/ueba_baseline.json` for instant startup
-
-### FUSION Engine (`fusion.py`)
-
-Combines L4 scored incidents with L5 UEBA scores into final actionable alerts.
-
-- **Risk calculation:** `60% * incident_priority + 40% * max_ueba_score + volume_boost`
-- **Volume boost:** +5 (5+ alerts), +10 (10+ alerts), +15 (20+ alerts)
-- **UEBA escalation** -- behavioral anomalies can escalate incident severity by up to 2 levels
-- **Dual-input streaming** -- round-robin polling of incidents and UEBA scores with 10-minute correlation window
-- **Threat levels:** imminent (>=90), severe (70-89), elevated (50-69), moderate (30-49), low (<30)
+- **SLA assignment** -- maps priority score to P1-P4 with response and resolution time targets
 
 ## Detection Rules
 
@@ -277,13 +222,13 @@ Combines L4 scored incidents with L5 UEBA scores into final actionable alerts.
 | RISK-001 | Critical Risk Score Event | single | High Risk | critical | TA0001 |
 | RISK-002 | Sustained High-Risk Activity | aggregation | High Risk | high | TA0001 |
 
-Rules are **source-agnostic** -- they match on enrichment fields computed uniformly for all Wazuh event types rather than on specific Wazuh rule IDs. Blocked/denied traffic is excluded from exfiltration rules to prevent false positives from routine firewall blocks.
+Rules are **source-agnostic** -- they match on enrichment fields computed uniformly for all Wazuh event types (SSH, FortiGate, Windows, Cisco, AWS, VPN, etc.) rather than on specific Wazuh rule IDs. Blocked/denied traffic is excluded from exfiltration rules to prevent false positives from routine firewall blocks.
 
 Rules support nested `AND`/`OR`/`NOT` conditions with operators: `eq`, `ne`, `gt`, `gte`, `lt`, `lte`, `in`, `not_in`, `contains`, `regex`. Aggregation rules support `group_by` fields and `unique_field` for counting distinct values (e.g., unique source IPs instead of raw event count).
 
 ## Output Format
 
-### Scored Incidents (`scored_incidents.jsonl`)
+Final output in `scored_incidents.jsonl`:
 
 ```json
 {
@@ -343,10 +288,6 @@ Rules support nested `AND`/`OR`/`NOT` conditions with operators: `eq`, `ne`, `gt
 }
 ```
 
-### Fused Alerts (`correlated_UEBA_alerts.jsonl`)
-
-The fusion layer adds UEBA behavioral analysis, network intelligence summary, final threat level assessment, and SLA/response guidance on top of the scored incident.
-
 ## Priority Levels
 
 | Priority | Score Range | Response SLA | Resolution SLA | Escalation |
@@ -362,7 +303,6 @@ The fusion layer adds UEBA behavioral analysis, network intelligence summary, fi
 |------|---------|
 | `correlation_rules.yaml` | 16 detection rules with conditions, thresholds, MITRE ATT&CK mapping |
 | `context_config.yaml` | Asset criticality, user privileges, IP range context, impact matrix, SLA definitions |
-| `ueba_config.yaml` | UEBA thresholds, risk weights, anomaly type configuration, baseline learning parameters |
 
 ### `context_config.yaml` structure
 
@@ -411,8 +351,6 @@ In `--follow` mode, all pipeline processes run simultaneously:
 [enrich_json.py --follow] tails    -->  normalized.jsonl  writes to -->  enriched.jsonl
 [unified_correlation_engine.py --follow] tails --> enriched.jsonl writes to --> incidents.jsonl
 [context_scorer.py --follow] tails --> incidents.jsonl writes to --> scored_incidents.jsonl
-[ueba.py --follow] tails --> enriched.jsonl writes to --> ueba_scores.jsonl
-[fusion.py --follow] tails --> scored_incidents.jsonl + ueba_scores.jsonl
 ```
 
 Each `JSONLTailer` (from `file_tailer.py`):
@@ -431,10 +369,6 @@ State files are stored in `.state/`:
 | `enricher.state` | `enrich_json.py` |
 | `correlation.state` | `unified_correlation_engine.py` |
 | `scorer.state` | `context_scorer.py` |
-| `ueba.state` | `ueba.py` |
-| `ueba_baseline.json` | `ueba.py` (behavioral baselines) |
-| `fusion_incidents.state` | `fusion.py` |
-| `fusion_ueba.state` | `fusion.py` |
 
 Shutdown sequence: `SIGINT` -> wait 10 seconds for graceful exit -> `SIGKILL` stragglers.
 
@@ -447,12 +381,9 @@ CyberSentinel-Event-Correlation/
     enrich_json.py                    # L2 - Network intelligence enrichment
     unified_correlation_engine.py     # L3 - Rule-based detection & correlation
     context_scorer.py                 # L4 - Business context & priority scoring
-    ueba.py                           # L5 - User & Entity Behavior Analytics
-    fusion.py                         # FUSION - Combines L4 + L5 into final alerts
     file_tailer.py                    # Shared JSONL tailing module
     correlation_rules.yaml            # 16 detection rules (8 categories)
     context_config.yaml               # Asset criticality, users, impact matrix, SLA
-    ueba_config.yaml                  # UEBA thresholds and baseline config
     ARCHITECTURE.md                   # Technical architecture documentation
     databases/                        # GeoIP, ASN, Tor, reputation databases
     rules/                            # Reference Wazuh XML rule definitions
