@@ -299,23 +299,20 @@ class ContextScoringEngine:
         priority_analysis = self.priority_scorer.calculate_priority(incident, impact_analysis)
         
         # Build scored incident
-        scored_incident = {
-            "scored_at": datetime.utcnow().isoformat() + "Z",
-            "alert_id": incident.get("alert_id"),
-            "original_incident": incident,
-            "context": {
-                "asset": asset_ctx,
-                "user": user_ctx
-            },
-            "impact_analysis": impact_analysis,
-            "priority": priority_analysis,
-            "recommended_actions": self._generate_actions(
-                incident,
-                impact_analysis,
-                priority_analysis
-            )
-        }
-        
+        l4_actions = self._generate_actions(incident, impact_analysis, priority_analysis)
+        l3_actions = incident.get("recommended_actions", [])
+        # Merge L3 + L4 actions, deduplicated, L3 first
+        seen = set()
+        merged_actions = []
+        for a in l3_actions + l4_actions:
+            if a not in seen:
+                merged_actions.append(a)
+                seen.add(a)
+
+        scored_incident = self._build_scored_output(
+            incident, asset_ctx, user_ctx,
+            impact_analysis, priority_analysis, merged_actions
+        )
         self.scored_incidents.append(scored_incident)
 
     def process_incident_streaming(self, incident: Dict[str, Any]) -> Dict[str, Any]:
@@ -351,23 +348,150 @@ class ContextScoringEngine:
         impact_analysis = self.impact_calculator.calculate_impact(incident, asset_ctx, user_ctx)
         priority_analysis = self.priority_scorer.calculate_priority(incident, impact_analysis)
 
-        scored_incident = {
-            "scored_at": datetime.utcnow().isoformat() + "Z",
-            "alert_id": incident.get("alert_id") or incident.get("incident_id"),
-            "original_incident": incident,
-            "context": {
-                "asset": asset_ctx,
-                "user": user_ctx
-            },
-            "impact_analysis": impact_analysis,
-            "priority": priority_analysis,
-            "recommended_actions": self._generate_actions(
-                incident, impact_analysis, priority_analysis
-            )
-        }
+        l4_actions = self._generate_actions(incident, impact_analysis, priority_analysis)
+        l3_actions = incident.get("recommended_actions", [])
+        seen = set()
+        merged_actions = []
+        for a in l3_actions + l4_actions:
+            if a not in seen:
+                merged_actions.append(a)
+                seen.add(a)
 
         # Don't accumulate — already written to disk by caller
-        return scored_incident
+        return self._build_scored_output(
+            incident, asset_ctx, user_ctx,
+            impact_analysis, priority_analysis, merged_actions
+        )
+
+    # Minimal keys for fusion — everything else lives at the scored output's
+    # top level and fusion._resolve_original() reconstructs the rest.
+    _FUSION_KEYS = ("alerts", "indicators_of_compromise", "rule", "event")
+
+    # Boilerplate actions added to every incident — filter these from output
+    _GENERIC_ACTIONS = frozenset({
+        "Initiate incident response procedure",
+        "Begin incident response procedure",
+        "Document all findings and timeline",
+        "Preserve logs and forensic evidence",
+        "Notify security stakeholders",
+        "Assign to security analyst for investigation",
+        "Monitor for escalation",
+    })
+
+    @staticmethod
+    def _clean_enrichment(enrichment: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove empty/null/false-only sections from enrichment."""
+        if not enrichment:
+            return {}
+        result = {}
+        for key, val in enrichment.items():
+            if val is None:
+                continue
+            if isinstance(val, dict):
+                # Strip empty lists and false bools within the section
+                cleaned = {k: v for k, v in val.items()
+                           if not (isinstance(v, list) and not v)
+                           and not (isinstance(v, bool) and not v)}
+                if cleaned:
+                    result[key] = cleaned
+            elif isinstance(val, bool) and not val:
+                continue
+            elif isinstance(val, (int, float)) and val:
+                result[key] = val
+            elif isinstance(val, list) and val:
+                result[key] = val
+        return result
+
+    @staticmethod
+    def _strip_empty(d: Dict[str, Any]) -> Dict[str, Any]:
+        """Remove keys whose values are None, empty lists, or empty dicts."""
+        return {k: v for k, v in d.items()
+                if v is not None
+                and v != []
+                and v != {}}
+
+    @staticmethod
+    def _clean_slim(slim: Dict[str, Any]) -> Dict[str, Any]:
+        """Clean the slim original_incident for fusion.
+
+        - Strips enrichment from alerts[0] (already at top level)
+        - Strips null values from alerts[0]
+        - Removes empty IOC/event dicts
+        """
+        if "alerts" in slim and slim["alerts"]:
+            cleaned_alert = {k: v for k, v in slim["alerts"][0].items()
+                            if v is not None and k != "enrichment"}
+            slim["alerts"] = [cleaned_alert] if cleaned_alert else []
+        if "indicators_of_compromise" in slim and not slim["indicators_of_compromise"]:
+            del slim["indicators_of_compromise"]
+        if "event" in slim and not slim["event"]:
+            del slim["event"]
+        return slim
+
+    def _build_scored_output(
+        self,
+        incident: Dict[str, Any],
+        asset_ctx: Dict[str, Any],
+        user_ctx: Dict[str, Any],
+        impact_analysis: Dict[str, Any],
+        priority_analysis: Dict[str, Any],
+        merged_actions: List[str],
+    ) -> Dict[str, Any]:
+        """Build concise scored output with flat top-level fields.
+
+        Everything is surfaced at top level for readability.
+        ``original_incident`` keeps only alerts[0], rule, IOCs for fusion.
+        Empty lists, empty dicts, and None values are stripped.
+        """
+        trigger = incident.get("trigger_point", {})
+        entities = incident.get("affected_entities", {})
+        attack_chain = incident.get("attack_chain", {})
+
+        # Filter generic boilerplate from recommended actions
+        specific_actions = [a for a in merged_actions
+                           if a not in self._GENERIC_ACTIONS]
+        if not specific_actions:
+            specific_actions = merged_actions[:3]
+
+        # Clean enrichment — strip empty sections
+        enrichment = self._clean_enrichment(
+            incident.get("enrichment_summary") or {}
+        )
+
+        # Slim original_incident for fusion, then clean it
+        slim = {k: incident[k] for k in self._FUSION_KEYS if k in incident}
+        slim = self._clean_slim(slim)
+
+        result = {
+            "scored_at": datetime.utcnow().isoformat() + "Z",
+            "incident_id": incident.get("incident_id"),
+            "severity": incident.get("severity"),
+            "priority_level": priority_analysis.get("priority_level"),
+            "priority_score": priority_analysis.get("priority_score"),
+            "title": incident.get("title"),
+            "first_seen": incident.get("first_seen"),
+            "last_seen": incident.get("last_seen"),
+            "duration_seconds": incident.get("duration_seconds", 0),
+            "alert_count": incident.get("alert_count", 0),
+            "trigger_point": trigger or None,
+            "source_ips": entities.get("source_ips", []),
+            "target_ips": entities.get("target_ips", []),
+            "affected_hosts": entities.get("affected_hosts", []),
+            "affected_users": entities.get("affected_users", []),
+            "attack_pattern": attack_chain.get("attack_pattern"),
+            "mitre_tactics": attack_chain.get("tactics", []),
+            "alert_summary": incident.get("alert_summary", []),
+            "enrichment": enrichment,
+            "impact_score": impact_analysis.get("impact_score", 0),
+            "impact_level": impact_analysis.get("impact_level", "unknown"),
+            "asset_criticality": asset_ctx.get("criticality", "unknown"),
+            "sla": priority_analysis.get("sla", {}),
+            "recommended_actions": specific_actions,
+            "original_incident": slim,
+        }
+
+        # Strip empty lists, empty dicts, and None values
+        return self._strip_empty(result)
 
     def _generate_actions(
         self,
