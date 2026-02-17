@@ -218,8 +218,10 @@ class GeoTracker:
             
             if time_diff > 0 and distance_km > 0:
                 max_speed_kmh = distance_km / time_diff
-                is_impossible = max_speed_kmh > 1000
-                
+                # Require >= 5 min gap: shorter gaps are almost always
+                # VPN/proxy IP reassignment, not real travel.
+                is_impossible = max_speed_kmh > 1000 and time_diff >= (5.0 / 60)
+
                 result = {
                     "is_impossible_travel": is_impossible,
                     "previous_location": f"{last['city']}, {last['country']}",
@@ -499,9 +501,11 @@ class LogEnricher:
             "is_lateral_movement": diversity.get("unique_dest_ips", 0) > 20,
             "is_brute_force": counters.get("user_5m", 0) > 15 and normalized_action in ["denied", "blocked"],
             "is_data_exfil": (
-                src_ip_type == "private" and 
-                dest_ip_type == "public" and 
-                counters.get("src_ip_5m", 0) > 30
+                src_ip_type == "private" and
+                dest_ip_type == "public" and
+                normalized_action not in ("blocked", "denied") and
+                counters.get("src_ip_5m", 0) > 100 and
+                diversity.get("unique_dest_ips", 0) <= 3
             ),
             "is_after_hours": not temporal.get("is_business_hours", True),
         }
@@ -547,9 +551,6 @@ class LogEnricher:
             except (ValueError, TypeError):
                 score = 0
         
-        if normalized_action in ["denied", "blocked"]:
-            score += 15
-        
         if failure_count > 10:
             score += 20
         elif failure_count > 5:
@@ -590,6 +591,10 @@ class LogEnricher:
                 threat_confidence = network_intel.get("threat_confidence", 0.0)
                 score += int(30 * threat_confidence)
         
+        # Blocked/denied traffic: the firewall handled it — reduce risk
+        if normalized_action in ("blocked", "denied"):
+            score = max(score - 30, 0)
+
         return min(score, 100)
     
     def parse_timestamp(self, ts_str: str) -> Optional[datetime]:

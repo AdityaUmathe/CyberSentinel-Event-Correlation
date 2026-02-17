@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
-Complete SIEM Pipeline Orchestrator
-Runs all 5 layers in sequence (batch) or in parallel (--follow).
+SIEM Pipeline Orchestrator
+Runs the correlation pipeline in sequence (batch) or in parallel (--follow).
 
 Architecture:
     L1: Normalization (normalized.jsonl)
     L2: Enrichment (enriched.jsonl)
     L3: Event Correlation (incidents.jsonl)
-    L4: Context & Scoring (scored_incidents.jsonl)
-    L5: UEBA (ueba_scores.jsonl) - parallel to L3/L4
-    Final: Fusion (correlated_UEBA_alerts.jsonl)
+    L4: Context & Scoring (scored_incidents.jsonl)  <-- final output
 
 Usage:
     Batch:      python3 pipeline.py --input normalized.jsonl --all
@@ -37,7 +35,7 @@ class PipelineOrchestrator:
         self.layers = {
             "L1": {
                 "name": "Normalization",
-                "script": "normalize.py",
+                "script": "normalizer.py",
                 "input": input_file,
                 "output": "normalized.jsonl",
                 "optional": False
@@ -57,23 +55,13 @@ class PipelineOrchestrator:
             },
             "L3": {
                 "name": "Event Correlation",
-                "script": "correlation_engine.py",
+                "script": "unified_correlation_engine.py",
                 "input": "enriched.jsonl",
                 "output": "incidents.jsonl",
                 "args": [
                     "--rules", "correlation_rules.yaml"
                 ],
                 "optional": False
-            },
-            "L5": {
-                "name": "UEBA",
-                "script": "ueba.py",
-                "input": "enriched.jsonl",
-                "output": "ueba_scores.jsonl",
-                "args": [
-                    "--config", "ueba_config.yaml"
-                ],
-                "optional": True
             },
             "L4": {
                 "name": "Context & Scoring",
@@ -82,17 +70,6 @@ class PipelineOrchestrator:
                 "output": "scored_incidents.jsonl",
                 "args": [
                     "--config", "context_config.yaml"
-                ],
-                "optional": False
-            },
-            "FUSION": {
-                "name": "Final Fusion",
-                "script": "fusion.py",
-                "input": "scored_incidents.jsonl",
-                "output": "correlated_UEBA_alerts.jsonl",
-                "args": [
-                    "--incidents", "scored_incidents.jsonl",
-                    "--ueba", "ueba_scores.jsonl"
                 ],
                 "optional": False
             }
@@ -171,7 +148,7 @@ class PipelineOrchestrator:
         print(f"{'#'*60}")
 
         # Determine which layers to run
-        layer_order = ["L1", "L2", "L3", "L5", "L4", "FUSION"]
+        layer_order = ["L1", "L2", "L3", "L4"]
 
         start_index = layer_order.index(self.start_layer)
         layers_to_run = layer_order[start_index:]
@@ -219,10 +196,10 @@ class PipelineOrchestrator:
         print(f"{'='*60}")
 
         if success:
-            print(f"\n✓ Final output: correlated_UEBA_alerts.jsonl")
+            print(f"\n✓ Final output: scored_incidents.jsonl")
             print(f"\nNext steps:")
-            print(f"  1. Review alerts: cat correlated_UEBA_alerts.jsonl | jq '.'")
-            print(f"  2. Filter by severity: cat correlated_UEBA_alerts.jsonl | jq 'select(.final_assessment.severity == \"P1\")'")
+            print(f"  1. Review incidents: cat scored_incidents.jsonl | jq '.'")
+            print(f"  2. Filter by priority: cat scored_incidents.jsonl | jq 'select(.priority.priority_level == \"P1\")'")
             print(f"  3. Export to SIEM/dashboard")
         else:
             print(f"\n✗ Pipeline did not complete successfully")
@@ -235,7 +212,6 @@ class StreamingPipelineOrchestrator:
 
     Each downstream JSONLTailer waits for its input file to appear,
     providing natural ordering without explicit sequencing.
-    L3 and L5 both independently tail enriched.jsonl with separate state files.
     """
 
     STATE_DIR = ".state"
@@ -287,19 +263,6 @@ class StreamingPipelineOrchestrator:
                     "--state-file", f"{self.STATE_DIR}/correlation.state",
                 ],
             },
-            "L5": {
-                "name": "UEBA",
-                "script": "ueba.py",
-                "cmd_extra": [
-                    "--input", "enriched.jsonl",
-                    "--output", "ueba_scores.jsonl",
-                    "--follow",
-                    "--state-file", f"{self.STATE_DIR}/ueba.state",
-                    "--baseline-file", f"{self.STATE_DIR}/ueba_baseline.json",
-                    "--config", "ueba_config.yaml",
-                ],
-                "optional": True,
-            },
             "L4": {
                 "name": "Context & Scoring",
                 "script": "context_scorer.py",
@@ -309,17 +272,6 @@ class StreamingPipelineOrchestrator:
                     "--follow",
                     "--state-file", f"{self.STATE_DIR}/scorer.state",
                     "--config", "context_config.yaml",
-                ],
-            },
-            "FUSION": {
-                "name": "Final Fusion",
-                "script": "fusion.py",
-                "cmd_extra": [
-                    "--incidents", "scored_incidents.jsonl",
-                    "--ueba", "ueba_scores.jsonl",
-                    "--output", "correlated_UEBA_alerts.jsonl",
-                    "--follow",
-                    "--state-file-prefix", f"{self.STATE_DIR}/fusion",
                 ],
             },
         }
@@ -360,7 +312,7 @@ class StreamingPipelineOrchestrator:
         signal.signal(signal.SIGTERM, self._signal_handler)
 
         # Determine layers to launch
-        layer_order = ["L1", "L2", "L3", "L5", "L4", "FUSION"]
+        layer_order = ["L1", "L2", "L3", "L4"]
         start_index = layer_order.index(self.start_layer)
         layers_to_run = layer_order[start_index:]
 
@@ -460,7 +412,7 @@ def main():
     parser = argparse.ArgumentParser(description="SIEM Pipeline Orchestrator")
     parser.add_argument("--input", required=True, help="Input file (raw logs or normalized logs)")
     parser.add_argument("--from", dest="start_layer", default="L1",
-                       choices=["L1", "L2", "L3", "L4", "L5", "FUSION"],
+                       choices=["L1", "L2", "L3", "L4"],
                        help="Start from specific layer")
     parser.add_argument("--all", action="store_true", help="Run complete pipeline from L1")
     parser.add_argument("--follow", action="store_true",

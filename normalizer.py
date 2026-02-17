@@ -384,8 +384,14 @@ def detect_os_and_type(alert: Dict[str, Any]) -> Tuple[Dict[str, Any], str]:
 def extract_host(alert: Dict[str, Any]) -> Dict[str, Any]:
     """Extract comprehensive host information with OS enrichment."""
     agent = alert.get('agent', {})
+    if not isinstance(agent, dict):
+        agent = {}
     manager = alert.get('manager', {})
+    if not isinstance(manager, dict):
+        manager = {}
     predecoder = alert.get('predecoder', {})
+    if not isinstance(predecoder, dict):
+        predecoder = {}
     
     # Host name priority
     host_name = (
@@ -415,19 +421,21 @@ def _extract_ips_from_log(full_log: str) -> Tuple[Optional[str], Optional[str]]:
     if not full_log:
         return None, None
 
-    # Pattern: "from <IP>" is almost always source IP in auth logs
-    from_match = re.search(r'\bfrom\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
+    # Pattern: "from [IP] <IP>" is almost always source IP in auth logs
+    from_match = re.search(r'\bfrom\s+(?:IP\s+)?(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
     src_ip = from_match.group(1) if from_match else None
 
     # Pattern: "to <IP>" or "on <IP>" is often destination
     to_match = re.search(r'\b(?:to|on)\s+(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
     dst_ip = to_match.group(1) if to_match else None
 
-    # Fallback: collect all IPs in order (first=src, second=dst)
+    # Fallback: collect unique IPs in order (first=src, second=dst)
     if not src_ip:
         all_ips = re.findall(r'\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b', full_log)
-        # Filter out broadcast/loopback
-        all_ips = [ip for ip in all_ips if not ip.startswith(('0.', '255.', '127.0.0.'))]
+        # Filter out broadcast/loopback, deduplicate preserving order
+        all_ips = list(dict.fromkeys(
+            ip for ip in all_ips if not ip.startswith(('0.', '255.', '127.0.0.'))
+        ))
         if all_ips:
             src_ip = all_ips[0]
             if len(all_ips) > 1 and not dst_ip:
@@ -482,7 +490,8 @@ def extract_entities(alert: Dict[str, Any]) -> Tuple[Dict, Dict]:
         'SourceAddress', 'ClientIP',
         'IpAddress', 'SourceNetworkAddress', 'CallerIPAddress',
         'ipAddress', 'remote_ip', 'remoteAddress', 'remote_addr',
-        'peer_address', 'clientip', 'attacker_ip')
+        'peer_address', 'clientip', 'attacker_ip',
+        'ui', 'remip')
     src_port = extract_port(data, 'src_port', 'srcport', 'sport', 'source_port', 'SourcePort')
     src_user = extract_user(data,
         'user', 'username', 'srcuser', 'SubjectUserName', 'UserName',
@@ -523,7 +532,15 @@ def extract_entities(alert: Dict[str, Any]) -> Tuple[Dict, Dict]:
             src_user = log_src_user
         if not dst_user:
             dst_user = log_dst_user
-    
+
+    # Wazuh 'location' fallback: for syslog/agentless sources this is the
+    # device IP (e.g. the FortiGate being targeted).  extract_ip validates
+    # IPv4 format, so file-path locations like "/var/log/syslog" are rejected.
+    if not dst_ip:
+        loc = alert.get('location', '')
+        if loc and re.match(r'^\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}$', str(loc)):
+            dst_ip = loc
+
     # Object name (file, process, service, etc.)
     obj_name = safe_get(data,
         'file', 'filepath', 'file_path', 'path', 'TargetFilename', 'ObjectName',

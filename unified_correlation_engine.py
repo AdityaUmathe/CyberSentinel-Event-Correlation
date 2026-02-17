@@ -7,9 +7,9 @@ Single-step correlation: Enriched Logs → Correlated Incidents
 
 Features:
 - Rule-based alert detection
-- Automatic incident correlation by attack type
-- Time-window grouping
-- Entity-based correlation (IP, host, user)
+- Trigger-point based per-source-IP correlation
+- Three fixed trigger offsets: 5min, 30min, 24hr (cumulative)
+- Dual-firing: event-driven + timer-driven
 - Attack pattern identification
 - Incident severity scoring
 - MITRE ATT&CK mapping
@@ -27,17 +27,17 @@ import sys
 import time
 import yaml
 from collections import defaultdict, deque
-from datetime import datetime, timedelta
-from typing import Any, Dict, List, Optional, Set
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class TimeWindow:
     """Sliding time window for event aggregation."""
-    
+
     def __init__(self, window_seconds: int = 300):
         self.window_seconds = window_seconds
         self.events = deque()
-    
+
     def add_event(self, event: Dict[str, Any], timestamp: datetime):
         """Add event to window."""
         self.events.append({
@@ -45,17 +45,17 @@ class TimeWindow:
             "timestamp": timestamp
         })
         self._cleanup(timestamp)
-    
+
     def _cleanup(self, current_time: datetime):
         """Remove events outside the time window."""
         cutoff = current_time - timedelta(seconds=self.window_seconds)
         while self.events and self.events[0]["timestamp"] < cutoff:
             self.events.popleft()
-    
+
     def get_events(self) -> List[Dict[str, Any]]:
         """Get all events in current window."""
         return [e["event"] for e in self.events]
-    
+
     def count(self, filter_func=None) -> int:
         """Count events matching filter."""
         if filter_func is None:
@@ -65,7 +65,7 @@ class TimeWindow:
 
 class Rule:
     """Detection rule."""
-    
+
     def __init__(self, rule_config: Dict[str, Any]):
         self.id = rule_config.get("id", "unknown")
         self.name = rule_config.get("name", "Unknown Rule")
@@ -78,68 +78,68 @@ class Rule:
         self.mitre_tactics = rule_config.get("mitre_tactics", [])
         self.response = rule_config.get("response", [])
         self.rule_type = rule_config.get("type", "single")
-        
+
         # For aggregation rules
         self.time_window = rule_config.get("time_window", 300)
         self.group_by = rule_config.get("group_by", [])
         self.threshold = rule_config.get("threshold", {})
-    
+
     def evaluate(self, event: Dict[str, Any]) -> bool:
         """Evaluate if event matches rule conditions."""
         if not self.enabled:
             return False
-        
+
         return self._check_conditions(event, self.conditions)
-    
+
     def _check_conditions(self, event: Dict[str, Any], conditions: Dict[str, Any]) -> bool:
         """Recursively check conditions."""
         if not conditions:
             return True
-        
+
         # Handle logical operators
         if "AND" in conditions:
             return all(self._check_conditions(event, cond) for cond in conditions["AND"])
-        
+
         if "OR" in conditions:
             return any(self._check_conditions(event, cond) for cond in conditions["OR"])
-        
+
         if "NOT" in conditions:
             return not self._check_conditions(event, conditions["NOT"])
-        
+
         # Handle field comparisons
         for field, condition in conditions.items():
             if field in ["AND", "OR", "NOT"]:
                 continue
-            
+
             value = self._get_nested_value(event, field)
-            
+
             if not self._compare_value(value, condition):
                 return False
-        
+
         return True
-    
+
     def _get_nested_value(self, obj: Dict[str, Any], path: str) -> Any:
         """Get nested value using dot notation."""
         keys = path.split(".")
         current = obj
-        
+
         for key in keys:
             if isinstance(current, dict) and key in current:
                 current = current[key]
             else:
                 return None
-        
+
         return current
-    
+
     def _compare_value(self, value: Any, condition: Any) -> bool:
         """Compare value against condition."""
         if value is None:
             return False
-        
+
         # Direct equality
         if not isinstance(condition, dict):
             return value == condition
-        
+
         # Comparison operators
         if "eq" in condition:
             return value == condition["eq"]
@@ -162,20 +162,20 @@ class Rule:
         if "regex" in condition:
             import re
             return re.search(condition["regex"], str(value)) is not None
-        
+
         return False
 
 
 class Alert:
     """Security alert from rule match."""
-    
+
     def __init__(self, rule: Rule, event: Dict[str, Any], context: Dict[str, Any] = None):
         self.rule = rule
         self.event = event
         self.context = context or {}
         self.alert_id = self._generate_alert_id()
         self.timestamp = event.get("event_time", datetime.utcnow().isoformat() + "Z")
-    
+
     def _generate_alert_id(self) -> str:
         """Generate unique alert ID."""
         components = [
@@ -185,7 +185,7 @@ class Alert:
         ]
         id_string = "|".join(components)
         return hashlib.sha256(id_string.encode()).hexdigest()[:16]
-    
+
     def to_dict(self) -> Dict[str, Any]:
         """Convert alert to dictionary."""
         return {
@@ -206,12 +206,69 @@ class Alert:
         }
 
 
+class TriggerPointTracker:
+    """Per-source-IP tracker with recurring trigger intervals.
+
+    Fires every 5min, 30min, and 24hr continuously.  Each firing covers
+    only the alerts accumulated since the previous firing of that same
+    interval.  Trackers are cleaned up when no new alerts arrive for
+    longer than STALE_TIMEOUT.
+    """
+
+    TRIGGER_INTERVALS: List[Tuple[str, timedelta]] = [
+        ("5min",  timedelta(minutes=5)),
+        ("30min", timedelta(minutes=30)),
+        ("24hr",  timedelta(hours=24)),
+    ]
+    STALE_TIMEOUT = timedelta(hours=25)
+
+    def __init__(self, source_ip: str, first_seen: datetime):
+        self.source_ip = source_ip
+        self.first_seen = first_seen
+        self.alerts: List[Dict[str, Any]] = []
+        self.last_alert_time = first_seen
+        # Per-label: when last fired and how far into self.alerts was emitted
+        self.last_fired: Dict[str, datetime] = {}
+        self.emitted_up_to: Dict[str, int] = {}
+
+    def add_alert(self, alert: Dict[str, Any], alert_time: datetime):
+        """Add an alert to this tracker."""
+        self.alerts.append(alert)
+        if alert_time > self.last_alert_time:
+            self.last_alert_time = alert_time
+
+    def check_triggers(self, current_time: datetime) -> List[Tuple[str, timedelta]]:
+        """Return labels whose interval has elapsed and have new alerts."""
+        due = []
+        for label, interval in self.TRIGGER_INTERVALS:
+            ref = self.last_fired.get(label, self.first_seen)
+            if current_time >= ref + interval:
+                idx = self.emitted_up_to.get(label, 0)
+                if len(self.alerts) > idx:
+                    due.append((label, interval))
+        return due
+
+    def get_new_alerts(self, label: str) -> List[Dict[str, Any]]:
+        """Alerts accumulated since the last firing of *label*."""
+        idx = self.emitted_up_to.get(label, 0)
+        return self.alerts[idx:]
+
+    def mark_fired(self, label: str, current_time: datetime):
+        """Record that *label* just fired at *current_time*."""
+        self.last_fired[label] = current_time
+        self.emitted_up_to[label] = len(self.alerts)
+
+    def is_stale(self, current_time: datetime) -> bool:
+        """True when no new alerts for longer than STALE_TIMEOUT."""
+        return current_time - self.last_alert_time > self.STALE_TIMEOUT
+
+
 class UnifiedCorrelationEngine:
     """
-    Unified correlation engine that generates correlated incidents directly.
-    Combines alert generation and incident correlation in one pass.
+    Unified correlation engine using trigger-point based per-source-IP correlation.
+    Alerts are routed to IP trackers; triggers fire at 5min, 30min, 24hr offsets.
     """
-    
+
     def __init__(self, rules_config: Dict[str, Any], time_window_minutes: int = 60):
         self.rules = []
         self.time_window = timedelta(minutes=time_window_minutes)
@@ -222,72 +279,97 @@ class UnifiedCorrelationEngine:
         for rule_config in rules_config.get("rules", []):
             self.rules.append(Rule(rule_config))
 
-        # Alert buffering for correlation
+        # Alert buffering for batch mode
         self.alert_buffer = []
 
         # Time windows for aggregation rules
         self.windows = {}
 
-        # --- Streaming state ---
-        # Open incidents keyed by correlation group key
-        self.open_incidents = {}
+        # --- Trigger-point state ---
+        self.ip_trackers: Dict[str, TriggerPointTracker] = {}
+
         # Track which aggregation rule+group has already fired to avoid re-firing
-        self._aggregation_fired = {}  # (rule_id, group_key) -> datetime (fired time)
-        # Counter for streaming mode (avoids growing alert_buffer)
+        self._aggregation_fired = {}
+        # Counter for streaming mode
         self._streaming_alert_count = 0
-        
+
     def process_events(self, events: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         """
-        Process all events and generate correlated incidents.
-        
-        Args:
-            events: List of enriched log events
-            
-        Returns:
-            List of correlated incident dictionaries
+        Process all events and generate correlated incidents (batch mode).
+
+        Routes alerts to IP trackers, then fires all triggers at a synthetic
+        end-time so every IP produces 3 trigger records (5min, 30min, 24hr).
         """
         # Step 1: Generate alerts from events
         print(f"Generating alerts from {len(events)} events...", file=sys.stderr)
-        
+
         for event in events:
             self._process_single_event(event)
-        
-        print(f"✓ Generated {len(self.alert_buffer)} alerts", file=sys.stderr)
-        
-        # Step 2: Correlate alerts into incidents
-        print(f"Correlating alerts into incidents...", file=sys.stderr)
-        incidents = self._correlate_alerts()
-        print(f"✓ Created {len(incidents)} incident(s)", file=sys.stderr)
-        
+
+        print(f"Generated {len(self.alert_buffer)} alerts", file=sys.stderr)
+
+        if not self.alert_buffer:
+            return []
+
+        # Step 2: Route all buffered alerts to IP trackers
+        # Collect any immediate emissions (standalone alerts with no source IP)
+        print(f"Routing alerts to trigger-point trackers...", file=sys.stderr)
+        incidents = []
+        for alert in sorted(self.alert_buffer, key=lambda a: a.get('timestamp', '')):
+            alert_time = self._parse_timestamp(alert.get('timestamp'))
+            if not alert_time:
+                alert_time = datetime.now(timezone.utc)
+            emissions = self._route_alert_to_tracker(alert, alert_time)
+            incidents.extend(emissions)
+
+        # Step 3: Fire all triggers at synthetic end-time
+        # Find the max event time and add 24hr+1s so all 3 triggers fire
+        max_time = None
+        for alert in self.alert_buffer:
+            t = self._parse_timestamp(alert.get('timestamp'))
+            if t and (max_time is None or t > max_time):
+                max_time = t
+        if max_time is None:
+            max_time = datetime.now(timezone.utc)
+        synthetic_end = max_time + timedelta(hours=24, seconds=1)
+
+        for tracker in list(self.ip_trackers.values()):
+            emissions = self._check_and_fire_triggers(tracker, synthetic_end)
+            incidents.extend(emissions)
+
+        # In batch mode, all trackers are done — clean them up
+        self.ip_trackers.clear()
+
+        # Sort incidents by severity and time
+        incidents.sort(key=lambda x: (
+            self._severity_rank(x['severity']),
+            x['first_seen']
+        ), reverse=True)
+
+        print(f"Created {len(incidents)} incident(s)", file=sys.stderr)
         return incidents
-    
+
     def _process_single_event(self, event: Dict[str, Any]):
-        """Process single event through all rules."""
+        """Process single event through all rules (batch mode alert generation)."""
         event_time = self._parse_timestamp(event.get("event_time"))
         if not event_time:
-            event_time = datetime.utcnow()
-        
-        # Check single-event rules
+            event_time = datetime.now(timezone.utc)
+
         for rule in self.rules:
             if rule.rule_type == "single" and rule.evaluate(event):
                 alert = Alert(rule, event)
                 self.alert_buffer.append(alert.to_dict())
-            
-            # Check aggregation rules
+
             elif rule.rule_type == "aggregation":
-                # Initialize window if needed
                 if rule.id not in self.windows:
                     self.windows[rule.id] = TimeWindow(rule.time_window)
-                
-                # Add to window
+
                 self.windows[rule.id].add_event(event, event_time)
-                
-                # Check if threshold met
+
                 window_events = self.windows[rule.id].get_events()
                 if self._check_aggregation_threshold(rule, window_events):
-                    # Create alert for aggregation match
                     alert = Alert(
-                        rule, 
+                        rule,
                         event,
                         context={
                             "aggregation": {
@@ -297,29 +379,171 @@ class UnifiedCorrelationEngine:
                         }
                     )
                     self.alert_buffer.append(alert.to_dict())
-    
+
     def _check_aggregation_threshold(self, rule: Rule, events: List[Dict[str, Any]]) -> bool:
         """Check if aggregation threshold is met."""
         if not events:
             return False
-        
-        # Group by specified fields
+
         groups = defaultdict(list)
         for event in events:
             if rule.evaluate(event):
                 group_key = self._get_group_key(event, rule.group_by)
                 groups[group_key].append(event)
-        
-        # Check threshold for each group
+
         threshold_config = rule.threshold.get("count", {})
         min_count = threshold_config.get("gte", 1)
-        
+        unique_field = threshold_config.get("unique_field")
+
         for group_events in groups.values():
-            if len(group_events) >= min_count:
+            count = self._count_for_threshold(group_events, unique_field)
+            if count >= min_count:
                 return True
-        
+
         return False
-    
+
+    def _count_for_threshold(self, events: List[Dict[str, Any]], unique_field: Optional[str] = None) -> int:
+        """Count events or unique field values for threshold comparison."""
+        if not unique_field:
+            return len(events)
+        values = set()
+        for event in events:
+            val = self._get_nested_value(event, unique_field)
+            if val is not None:
+                values.add(val)
+        return len(values)
+
+    # ==================================================================
+    # Trigger-point routing and emission
+    # ==================================================================
+
+    @staticmethod
+    def _extract_source_ip(alert: Dict[str, Any]) -> Optional[str]:
+        """Extract source IP from alert's event.subject.ip."""
+        return alert.get('event', {}).get('subject', {}).get('ip')
+
+    def _route_alert_to_tracker(self, alert: Dict[str, Any], alert_time: datetime) -> List[Dict[str, Any]]:
+        """
+        Route an alert to the appropriate IP tracker.
+        Creates tracker if needed, adds alert, checks triggers.
+        Returns any trigger emissions.
+        """
+        source_ip = self._extract_source_ip(alert)
+        if not source_ip:
+            return [self._create_standalone_incident(alert)]
+
+        # Create tracker if this is first alert for this IP
+        if source_ip not in self.ip_trackers:
+            self.ip_trackers[source_ip] = TriggerPointTracker(source_ip, alert_time)
+
+        tracker = self.ip_trackers[source_ip]
+        tracker.add_alert(alert, alert_time)
+
+        # Check for event-driven trigger fires
+        return self._check_and_fire_triggers(tracker, alert_time)
+
+    def _check_and_fire_triggers(self, tracker: TriggerPointTracker, current_time: datetime) -> List[Dict[str, Any]]:
+        """Check tracker for due triggers and fire them."""
+        emissions = []
+        for label, interval in tracker.check_triggers(current_time):
+            incident = self._emit_trigger_point(tracker, label, current_time)
+            if incident:
+                tracker.mark_fired(label, current_time)
+                emissions.append(incident)
+        return emissions
+
+    def _emit_trigger_point(self, tracker: TriggerPointTracker, trigger_label: str, current_time: datetime) -> Optional[Dict[str, Any]]:
+        """Build incident dict for a trigger point emission.
+
+        Uses only the alerts accumulated since the previous firing of this
+        label (not cumulative across all time).
+        """
+        new_alerts = tracker.get_new_alerts(trigger_label)
+        if not new_alerts:
+            return None
+
+        group_key = f"trigger_{tracker.source_ip}_{trigger_label}"
+        incident = self._create_incident(new_alerts, group_key)
+
+        ref_time = tracker.last_fired.get(trigger_label, tracker.first_seen)
+
+        def _fmt(dt):
+            return dt.isoformat() + ("Z" if dt.tzinfo is None else "")
+
+        incident["trigger_point"] = {
+            "label": trigger_label,
+            "source_ip": tracker.source_ip,
+            "window_start": _fmt(ref_time),
+            "window_end": _fmt(current_time),
+            "alerts_in_window": len(new_alerts),
+        }
+
+        incident["trigger_summary"] = self._generate_trigger_summary(
+            tracker, trigger_label, new_alerts, ref_time, current_time
+        )
+
+        return incident
+
+    def _generate_trigger_summary(self, tracker: TriggerPointTracker, trigger_label: str,
+                                  alerts: List[Dict[str, Any]],
+                                  window_start: datetime, window_end: datetime) -> str:
+        """Build a multi-line trigger summary string."""
+        categories = defaultdict(int)
+        severities = defaultdict(int)
+        target_ips = set()
+        users = set()
+
+        for alert in alerts:
+            rule = alert.get('rule', {})
+            categories[rule.get('category', 'unknown')] += 1
+            severities[rule.get('severity', 'unknown')] += 1
+            entities = self._extract_alert_entities(alert)
+            if entities['target_ip']:
+                target_ips.add(entities['target_ip'])
+            if entities['user']:
+                users.add(entities['user'])
+
+        attack_info = self._analyze_attack_patterns(alerts)
+
+        def _fmt(dt):
+            return dt.isoformat() + ("Z" if dt.tzinfo is None else "")
+
+        lines = [
+            f"Trigger: {trigger_label} | Source IP: {tracker.source_ip}",
+            f"Window: {_fmt(window_start)} to {_fmt(window_end)}",
+            f"Alerts: {len(alerts)}",
+            f"Categories: {', '.join(f'{k}: {v}' for k, v in sorted(categories.items(), key=lambda x: -x[1]))}",
+            f"Severities: {', '.join(f'{k}: {v}' for k, v in sorted(severities.items(), key=lambda x: -x[1]))}",
+        ]
+        if target_ips:
+            lines.append(f"Targets: {', '.join(sorted(target_ips)[:5])}")
+        if users:
+            lines.append(f"Users: {', '.join(sorted(users)[:5])}")
+        lines.append(f"Pattern: {attack_info['pattern']}")
+
+        return '\n'.join(lines)
+
+    def _create_standalone_incident(self, alert: Dict[str, Any]) -> Dict[str, Any]:
+        """Create an immediate incident for alerts with no source IP."""
+        group_key = f"standalone_{alert.get('alert_id', 'unknown')}"
+        incident = self._create_incident([alert], group_key)
+
+        alert_time_str = alert.get('timestamp', datetime.utcnow().isoformat() + "Z")
+
+        incident["trigger_point"] = {
+            "label": "immediate",
+            "source_ip": None,
+            "window_start": alert_time_str,
+            "window_end": alert_time_str,
+            "alerts_in_window": 1,
+        }
+        incident["trigger_summary"] = (
+            f"Trigger Point: immediate (no source IP)\n"
+            f"Alert: {alert.get('rule', {}).get('name', 'Unknown')}\n"
+            f"Severity: {alert.get('rule', {}).get('severity', 'unknown')}"
+        )
+        return incident
+
     # ==================================================================
     # Streaming methods
     # ==================================================================
@@ -328,22 +552,19 @@ class UnifiedCorrelationEngine:
         """
         Process one event in streaming mode.
 
-        Returns a list of incident dicts that were created or updated.
-        Each incident is emitted as a new JSONL line (append-only);
-        downstream consumers should take the latest by incident_id.
+        Returns a list of incident dicts emitted by trigger-point firing.
         """
         emitted = []
         event_time = self._parse_timestamp(event.get("event_time"))
         if not event_time:
-            event_time = datetime.utcnow()
+            event_time = datetime.now(timezone.utc)
 
         for rule in self.rules:
             if rule.rule_type == "single" and rule.evaluate(event):
                 alert = Alert(rule, event).to_dict()
                 self._streaming_alert_count += 1
-                incident = self._correlate_single_alert(alert)
-                if incident is not None:
-                    emitted.append(incident)
+                emissions = self._route_alert_to_tracker(alert, event_time)
+                emitted.extend(emissions)
 
             elif rule.rule_type == "aggregation":
                 if rule.id not in self.windows:
@@ -364,10 +585,13 @@ class UnifiedCorrelationEngine:
 
                     threshold_config = rule.threshold.get("count", {})
                     min_count = threshold_config.get("gte", 1)
+                    unique_field = threshold_config.get("unique_field")
 
-                    if len(groups.get(group_key, [])) >= min_count:
+                    group_events = groups.get(group_key, [])
+                    count = self._count_for_threshold(group_events, unique_field)
+                    if count >= min_count:
                         if fire_key not in self._aggregation_fired:
-                            self._aggregation_fired[fire_key] = datetime.utcnow()
+                            self._aggregation_fired[fire_key] = datetime.now(timezone.utc)
                             alert = Alert(
                                 rule, event,
                                 context={
@@ -378,105 +602,46 @@ class UnifiedCorrelationEngine:
                                 },
                             ).to_dict()
                             self._streaming_alert_count += 1
-                            incident = self._correlate_single_alert(alert)
-                            if incident is not None:
-                                emitted.append(incident)
+                            emissions = self._route_alert_to_tracker(alert, event_time)
+                            emitted.extend(emissions)
 
         return emitted
 
-    # Emit thresholds: re-emit incident when alert count crosses these values
-    _EMIT_THRESHOLDS = {1, 2, 3, 5, 10, 20, 50, 100, 200, 500, 1000}
-
-    def _should_emit(self, prev_count: int, new_count: int) -> bool:
-        """Decide whether to re-emit an updated incident.
-
-        Re-emit on the first alert, when a threshold is crossed, or
-        every 50 alerts above 100 to keep output manageable.
+    def flush_trackers(self) -> List[Dict[str, Any]]:
         """
-        if new_count in self._EMIT_THRESHOLDS:
-            return True
-        if new_count > 100 and new_count % 50 == 0:
-            return True
-        return False
-
-    def _correlate_single_alert(self, alert: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        Timer-driven flush: fire any overdue recurring triggers, remove
+        stale trackers (no alerts for >25 hours), clean aggregation state.
         """
-        Try to merge alert into an existing open incident.
-        If no match, create a new incident.
-        Returns the (new or updated) incident dict, or None if throttled.
-        """
-        for group_key, incident in self.open_incidents.items():
-            group_alerts = incident.get("_alerts", [])
-            if self._should_correlate_alert(alert, group_alerts):
-                prev_count = len(group_alerts)
-                original_id = incident.get("incident_id")
-                # Merge into existing incident
-                group_alerts.append(alert)
-                updated = self._rebuild_incident(group_alerts, group_key, existing_id=original_id)
-                updated["_alerts"] = group_alerts
-                self.open_incidents[group_key] = updated
+        now = datetime.now(timezone.utc)
+        emissions = []
 
-                # Throttle: only re-emit at meaningful thresholds
-                if not self._should_emit(prev_count, len(group_alerts)):
-                    return None
+        for ip, tracker in list(self.ip_trackers.items()):
+            fired = self._check_and_fire_triggers(tracker, now)
+            emissions.extend(fired)
 
-                # Return a clean copy (without internal _alerts list)
-                clean = {k: v for k, v in updated.items() if not k.startswith("_")}
-                return clean
+        # Remove stale trackers (no new alerts for >25 hours)
+        stale = [ip for ip, t in self.ip_trackers.items() if t.is_stale(now)]
+        for ip in stale:
+            del self.ip_trackers[ip]
 
-        # No match – always emit new incidents
-        new_key = self._generate_group_key(alert)
-        new_incident = self._create_incident([alert], new_key)
-        new_incident["_alerts"] = [alert]
-        self.open_incidents[new_key] = new_incident
-        clean = {k: v for k, v in new_incident.items() if not k.startswith("_")}
-        return clean
-
-    def _rebuild_incident(self, alerts: List[Dict[str, Any]], group_key: str,
-                          existing_id: Optional[str] = None) -> Dict[str, Any]:
-        """Rebuild incident dict from its alert list (for updates)."""
-        return self._create_incident(alerts, group_key, existing_id=existing_id)
-
-    def flush_expired_windows(self):
-        """
-        Clean up stale aggregation windows and evict expired open incidents.
-        Should be called periodically in the streaming loop.
-        """
-        now = datetime.utcnow().replace(tzinfo=None)
-        stale_cutoff = now - timedelta(minutes=self.time_window_minutes * 2)
-
-        # Evict old open incidents
-        expired_keys = []
-        for key, incident in self.open_incidents.items():
-            last_seen_str = incident.get("last_seen")
-            if last_seen_str:
-                last_seen = self._parse_timestamp(last_seen_str)
-                if last_seen:
-                    last_seen_naive = last_seen.replace(tzinfo=None)
-                    if last_seen_naive < stale_cutoff:
-                        expired_keys.append(key)
-
-        for key in expired_keys:
-            del self.open_incidents[key]
-
-        # Clean up aggregation fired keys — evict by age or empty window
+        # Clean up aggregation fired keys
+        stale_cutoff = now.replace(tzinfo=None) - timedelta(minutes=self.time_window_minutes * 2)
         stale_fire_keys = []
         for fire_key, fired_at in self._aggregation_fired.items():
             rule_id = fire_key[0]
-            # Evict if the window is empty
             if rule_id in self.windows:
                 window = self.windows[rule_id]
                 if window.count() == 0:
                     stale_fire_keys.append(fire_key)
-            # Evict if fired_at is older than stale_cutoff (handles orphaned keys)
             elif isinstance(fired_at, datetime) and fired_at.replace(tzinfo=None) < stale_cutoff:
                 stale_fire_keys.append(fire_key)
-            # Legacy True values without timestamp — evict if no window exists
             elif not isinstance(fired_at, datetime) and rule_id not in self.windows:
                 stale_fire_keys.append(fire_key)
 
         for fk in stale_fire_keys:
             del self._aggregation_fired[fk]
+
+        return emissions
 
     def _get_group_key(self, event: Dict[str, Any], group_fields: List[str]) -> str:
         """Generate grouping key from event fields."""
@@ -485,119 +650,20 @@ class UnifiedCorrelationEngine:
             value = self._get_nested_value(event, field)
             key_parts.append(str(value) if value else "null")
         return "|".join(key_parts)
-    
+
     def _get_nested_value(self, obj: Dict[str, Any], path: str) -> Any:
         """Get nested value using dot notation."""
         keys = path.split(".")
         current = obj
-        
+
         for key in keys:
             if isinstance(current, dict) and key in current:
                 current = current[key]
             else:
                 return None
-        
+
         return current
-    
-    def _correlate_alerts(self) -> List[Dict[str, Any]]:
-        """Correlate alerts into incidents by attack type and entities."""
-        if not self.alert_buffer:
-            return []
-        
-        # Sort alerts by timestamp
-        sorted_alerts = sorted(self.alert_buffer, key=lambda x: x.get('timestamp', ''))
-        
-        # Group alerts by correlation criteria
-        incident_groups = self._group_alerts_by_attack_type(sorted_alerts)
-        
-        # Create incident objects
-        incidents = []
-        for group_key, group_alerts in incident_groups.items():
-            incident = self._create_incident(group_alerts, group_key)
-            incidents.append(incident)
-        
-        # Sort incidents by severity and time
-        incidents.sort(key=lambda x: (
-            self._severity_rank(x['severity']),
-            x['first_seen']
-        ), reverse=True)
-        
-        return incidents
-    
-    def _group_alerts_by_attack_type(self, alerts: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
-        """
-        Group alerts into incidents based on attack type and entities.
-        
-        Correlation logic:
-        1. Same attack category (brute force, lateral movement, etc.)
-        2. Within time window
-        3. Shared entities (target IP, source IP, or host)
-        """
-        groups = {}
-        
-        for alert in alerts:
-            # Try to find matching group
-            matched = False
-            
-            for group_key, group_alerts in groups.items():
-                if self._should_correlate_alert(alert, group_alerts):
-                    groups[group_key].append(alert)
-                    matched = True
-                    break
-            
-            # Create new group if no match
-            if not matched:
-                new_key = self._generate_group_key(alert)
-                groups[new_key] = [alert]
-        
-        return groups
-    
-    def _should_correlate_alert(self, alert: Dict[str, Any], group_alerts: List[Dict[str, Any]]) -> bool:
-        """Determine if alert belongs to existing incident group."""
-        if not group_alerts:
-            return False
-        
-        first_alert = group_alerts[0]
-        
-        # 1. Check attack category - must match
-        alert_category = alert.get('rule', {}).get('category')
-        group_category = first_alert.get('rule', {}).get('category')
-        
-        if alert_category != group_category:
-            return False
-        
-        # 2. Check time window
-        alert_time = self._parse_timestamp(alert.get('timestamp'))
-        first_time = self._parse_timestamp(first_alert.get('timestamp'))
-        
-        if alert_time and first_time:
-            if abs(alert_time - first_time) > self.time_window:
-                return False
-        
-        # 3. Check entity overlap (same target, source, or host)
-        alert_entities = self._extract_alert_entities(alert)
-        
-        for group_alert in group_alerts:
-            group_entities = self._extract_alert_entities(group_alert)
-            
-            # Same target being attacked
-            if alert_entities['target_ip'] and alert_entities['target_ip'] == group_entities['target_ip']:
-                return True
-            
-            # Same source attacking
-            if alert_entities['source_ip'] and alert_entities['source_ip'] == group_entities['source_ip']:
-                return True
-            
-            # Same host involved
-            if alert_entities['host_id'] and alert_entities['host_id'] == group_entities['host_id']:
-                return True
-            
-            # Same target host (by hostname)
-            if alert_entities['host_name'] and alert_entities['host_name'] == group_entities['host_name']:
-                return True
-        
-        return False
-    
+
     _NOT_A_USER = frozenset({
         '/', '-', '.', '*', 'none', 'null', 'n/a', 'unknown', '',
         'system', 'local service', 'network service',
@@ -655,34 +721,69 @@ class UnifiedCorrelationEngine:
             'host_name': host.get('name'),
             'user': self._clean_user(subject.get('name')) or self._clean_user(obj.get('name'))
         }
-    
-    def _generate_group_key(self, alert: Dict[str, Any]) -> str:
-        """Generate unique group key for new incident."""
-        entities = self._extract_alert_entities(alert)
-        category = alert.get('rule', {}).get('category', 'unknown')
-        timestamp = alert.get('timestamp', '')[:16]  # Date+hour
-        
-        key_parts = [
-            category,
-            str(entities.get('target_ip', '')),
-            str(entities.get('host_id', '')),
-            timestamp
-        ]
-        return hashlib.md5('|'.join(key_parts).encode()).hexdigest()[:16]
-    
+
+    def _compact_alerts(self, alerts: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Group alerts by target IP, producing compact summaries instead of listing every alert.
+
+        Returns a list of dicts, one per target IP (or "unknown"), each containing:
+        target_ip, alert_count, rules triggered, severity breakdown, users, time range.
+        """
+        groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for alert in alerts:
+            entities = self._extract_alert_entities(alert)
+            target = entities['target_ip'] or "unknown"
+            groups[target].append(alert)
+
+        compact = []
+        for target_ip, group_alerts in sorted(groups.items(), key=lambda x: -len(x[1])):
+            rules = {}
+            severities = defaultdict(int)
+            users = set()
+            timestamps = []
+            original_event_ids_seen: set = set()
+            original_event_ids: list = []
+
+            for a in group_alerts:
+                rule = a.get('rule', {})
+                rule_name = rule.get('name', 'Unknown')
+                rules[rule_name] = rules.get(rule_name, 0) + 1
+                severities[rule.get('severity', 'unknown')] += 1
+                entities = self._extract_alert_entities(a)
+                if entities['user']:
+                    users.add(entities['user'])
+                ts = a.get('timestamp')
+                if ts:
+                    timestamps.append(ts)
+                eid = a.get('event', {}).get('event_id')
+                if eid and eid not in original_event_ids_seen:
+                    original_event_ids_seen.add(eid)
+                    original_event_ids.append(eid)
+
+            entry = {
+                "target_ip": target_ip if target_ip != "unknown" else None,
+                "alert_count": len(group_alerts),
+                "rules": rules,
+                "severities": dict(severities),
+            }
+            if users:
+                entry["users"] = sorted(users)
+            if timestamps:
+                entry["first_seen"] = min(timestamps)
+                entry["last_seen"] = max(timestamps)
+            if original_event_ids:
+                entry["original_event_ids"] = original_event_ids
+            compact.append(entry)
+
+        return compact
+
     def _create_incident(
         self,
         alerts: List[Dict[str, Any]],
         group_key: str,
         existing_id: Optional[str] = None,
     ) -> Dict[str, Any]:
-        """Create incident from grouped alerts.
-
-        Args:
-            existing_id: If set, reuse this incident_id (for rebuilds).
-                         Otherwise generate a new one.
-        """
-        # Extract timeline — filter out None timestamps
+        """Create incident from grouped alerts."""
+        # Extract timeline
         timestamps = [a.get('timestamp') for a in alerts if a.get('timestamp')]
         if not timestamps:
             now_str = datetime.utcnow().isoformat() + "Z"
@@ -690,27 +791,19 @@ class UnifiedCorrelationEngine:
         first_seen = min(timestamps)
         last_seen = max(timestamps)
 
-        # Calculate incident severity (highest alert severity)
         severities = [a.get('rule', {}).get('severity') for a in alerts]
         incident_severity = self._calculate_incident_severity(severities)
 
-        # Extract all affected entities
         entities = self._extract_incident_entities(alerts)
-
-        # Get attack patterns and tactics
         attack_info = self._analyze_attack_patterns(alerts)
-
-        # Combine recommendations
         recommendations = self._combine_recommendations(alerts)
 
-        # Incident ID: reuse existing or generate new
         if existing_id:
             incident_id = existing_id
         else:
             incident_id = f"INC-{self.incident_id_counter:06d}"
             self.incident_id_counter += 1
 
-        # Create incident summary
         incident = {
             "incident_id": incident_id,
             "severity": incident_severity,
@@ -728,8 +821,8 @@ class UnifiedCorrelationEngine:
                 "campaign_confidence": attack_info['confidence']
             },
             "affected_entities": entities,
-            "alerts": [self._summarize_alert(a) for a in alerts],
-            "indicators_of_compromise": self._extract_iocs(alerts),
+            "alert_summary": self._compact_alerts(alerts),
+            "alerts": [self._summarize_alert(alerts[0])] if alerts else [],
             "enrichment_summary": self._aggregate_enrichment(alerts),
             "recommended_actions": recommendations,
             "metadata": {
@@ -739,18 +832,23 @@ class UnifiedCorrelationEngine:
             }
         }
 
+        # Only include IOCs when there is actual data
+        iocs = self._extract_iocs(alerts)
+        if iocs:
+            incident["indicators_of_compromise"] = iocs
+
         return incident
-    
+
     def _calculate_incident_severity(self, severities: List[str]) -> str:
         """Calculate overall incident severity (highest wins)."""
         severity_order = ['critical', 'high', 'medium', 'low', 'info']
-        
+
         for severity in severity_order:
             if severity in severities:
                 return severity
-        
+
         return 'medium'
-    
+
     def _extract_incident_entities(self, alerts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Extract all affected entities from alerts."""
         source_ips = set()
@@ -773,7 +871,6 @@ class UnifiedCorrelationEngine:
                 hosts.add(entities['host_ip'])
             if entities['user']:
                 users.add(entities['user'])
-            # Also collect target/object user (e.g., targeted account in brute force)
             target_user = self._extract_target_user(alert)
             if target_user:
                 users.add(target_user)
@@ -795,49 +892,49 @@ class UnifiedCorrelationEngine:
         event = alert.get('event', {})
         obj = event.get('object', {})
         return self._clean_user(obj.get('name'))
-    
+
     def _analyze_attack_patterns(self, alerts: List[Dict[str, Any]]) -> Dict[str, Any]:
         """Analyze alerts to determine attack pattern."""
-        
-        # Collect all MITRE tactics
         all_tactics = []
         categories = []
-        
+        source_ips = set()
+
         for alert in alerts:
             rule = alert.get('rule', {})
             all_tactics.extend(rule.get('mitre_tactics', []))
             categories.append(rule.get('category'))
-        
+            src_ip = self._extract_source_ip(alert)
+            if src_ip:
+                source_ips.add(src_ip)
+
         tactics = sorted(list(set(all_tactics)))
         primary_category = max(set(categories), key=categories.count) if categories else 'unknown'
-        
-        # Determine attack pattern based on category and alert count
-        pattern, confidence = self._identify_attack_pattern(primary_category, len(alerts), categories)
-        
+
+        pattern, confidence = self._identify_attack_pattern(
+            primary_category, len(alerts), categories, len(source_ips)
+        )
+
         return {
             'tactics': tactics,
-            'techniques': [],  # Could be enhanced with technique extraction
+            'techniques': [],
             'pattern': pattern,
             'confidence': confidence
         }
-    
-    def _identify_attack_pattern(self, category: str, alert_count: int, categories: List[str]) -> tuple:
+
+    def _identify_attack_pattern(self, category: str, alert_count: int,
+                                 categories: List[str], source_count: int = 1) -> tuple:
         """Identify attack pattern based on alerts."""
-        
-        # Count categories
         category_counts = defaultdict(int)
         for cat in categories:
             category_counts[cat] += 1
-        
-        # Determine confidence based on alert count
+
         if alert_count >= 5:
             confidence = "high"
         elif alert_count >= 3:
             confidence = "medium"
         else:
             confidence = "low"
-        
-        # Pattern identification
+
         patterns = {
             'authentication': {
                 'pattern': 'Brute Force Attack Campaign',
@@ -868,198 +965,226 @@ class UnifiedCorrelationEngine:
                 'single_pattern': 'Suspicious Account Activity'
             }
         }
-        
+
         if category in patterns:
-            # Use multi-source pattern if multiple alerts
-            if alert_count >= 3 and 'multi_source_pattern' in patterns[category]:
+            if source_count > 1 and 'multi_source_pattern' in patterns[category]:
                 return patterns[category]['multi_source_pattern'], confidence
             elif 'pattern' in patterns[category]:
                 return patterns[category]['pattern'], confidence
             elif 'single_pattern' in patterns[category]:
                 return patterns[category]['single_pattern'], confidence
-        
-        # Default pattern
+
         return f"Multi-Stage Security Incident ({category})", confidence
-    
+
     def _combine_recommendations(self, alerts: List[Dict[str, Any]]) -> List[str]:
         """Combine and deduplicate recommendations from all alerts."""
         all_recs = []
         seen = set()
-        
-        # Add incident-level recommendations first
+
         incident_recs = [
             "Initiate incident response procedure",
             "Document all findings and timeline",
             "Preserve logs and forensic evidence",
             "Notify security stakeholders"
         ]
-        
+
         for rec in incident_recs:
             if rec not in seen:
                 all_recs.append(rec)
                 seen.add(rec)
-        
-        # Add alert-specific recommendations
+
         for alert in alerts:
             for rec in alert.get('recommended_response', []):
                 if rec not in seen:
                     all_recs.append(rec)
                     seen.add(rec)
-        
+
         return all_recs
-    
+
     def _extract_iocs(self, alerts: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-        """Extract indicators of compromise from all alerts."""
-        iocs = {
-            "malicious_ips": [],
-            "suspicious_ips": [],
-            "affected_ports": [],
-            "attack_signatures": [],
-            "compromised_accounts": []
-        }
-        
+        """Extract indicators of compromise from all alerts.
+
+        Only returns categories that actually have data — no empty arrays.
+        Does NOT auto-populate fields (e.g. auth target users are not
+        treated as "compromised accounts").
+        """
+        malicious_ips: List[str] = []
+        suspicious_ips: List[str] = []
+        affected_ports: List[Any] = []
+
         for alert in alerts:
             event = alert.get('event', {})
             enrich = event.get('enrich', {})
             network_intel = enrich.get('network_intel', {})
-            
-            # Extract malicious IPs
+
             src_rep = network_intel.get('src_reputation', {})
             if src_rep.get('ip_reputation') == 'malicious':
                 src_ip = event.get('subject', {}).get('ip')
-                if src_ip and src_ip not in iocs['malicious_ips']:
-                    iocs['malicious_ips'].append(src_ip)
+                if src_ip and src_ip not in malicious_ips:
+                    malicious_ips.append(src_ip)
             elif src_rep.get('ip_reputation') == 'suspicious':
                 src_ip = event.get('subject', {}).get('ip')
-                if src_ip and src_ip not in iocs['suspicious_ips']:
-                    iocs['suspicious_ips'].append(src_ip)
-            
-            # Extract ports
+                if src_ip and src_ip not in suspicious_ips:
+                    suspicious_ips.append(src_ip)
+
             dest_port = event.get('object', {}).get('port')
-            if dest_port and dest_port not in iocs['affected_ports']:
-                iocs['affected_ports'].append(dest_port)
-            
-            # Extract compromised accounts (from auth failures/success patterns)
-            if alert.get('rule', {}).get('category') == 'authentication':
-                user = event.get('subject', {}).get('name')
-                if user and user not in iocs['compromised_accounts']:
-                    iocs['compromised_accounts'].append(user)
-        
+            if dest_port and dest_port not in affected_ports:
+                affected_ports.append(dest_port)
+
+        # Only include categories with actual data
+        iocs: Dict[str, List] = {}
+        if malicious_ips:
+            iocs["malicious_ips"] = malicious_ips
+        if suspicious_ips:
+            iocs["suspicious_ips"] = suspicious_ips
+        if affected_ports:
+            iocs["affected_ports"] = affected_ports
         return iocs
-    
+
     def _generate_incident_title(self, alerts: List[Dict[str, Any]], attack_info: Dict[str, Any]) -> str:
         """Generate descriptive incident title."""
         pattern = attack_info['pattern']
         alert_count = len(alerts)
-        
+
         return f"{pattern} - {alert_count} Related Alert{'s' if alert_count != 1 else ''}"
-    
-    def _generate_incident_description(self, alerts: List[Dict[str, Any]], 
-                                      entities: Dict[str, Any], 
+
+    def _generate_incident_description(self, alerts: List[Dict[str, Any]],
+                                      entities: Dict[str, Any],
                                       attack_info: Dict[str, Any]) -> str:
         """Generate detailed incident description."""
-        
+
         desc_parts = [
             f"Security incident involving {len(alerts)} correlated alerts.",
             f"Attack Pattern: {attack_info['pattern']}",
             f"Confidence: {attack_info['confidence']}",
             f"\nAffected Infrastructure:"
         ]
-        
+
         if entities['source_ips']:
             sources_preview = ', '.join(entities['source_ips'][:3])
             if len(entities['source_ips']) > 3:
                 sources_preview += '...'
             desc_parts.append(f"  - {entities['total_sources']} source IP(s): {sources_preview}")
-        
+
         if entities['target_ips']:
             targets_preview = ', '.join(entities['target_ips'][:3])
             if len(entities['target_ips']) > 3:
                 targets_preview += '...'
             desc_parts.append(f"  - {entities['total_targets']} target IP(s): {targets_preview}")
-        
+
         if entities['affected_hosts']:
             desc_parts.append(f"  - Affected Hosts: {', '.join(entities['affected_hosts'][:5])}")
-        
+
         if entities['affected_users']:
             desc_parts.append(f"  - Affected Users: {', '.join(entities['affected_users'][:5])}")
-        
+
         if attack_info['tactics']:
             desc_parts.append(f"\nMITRE ATT&CK Tactics: {', '.join(attack_info['tactics'])}")
-        
+
         return '\n'.join(desc_parts)
-    
+
     def _summarize_alert(self, alert: Dict[str, Any]) -> Dict[str, Any]:
-        """Create summary of individual alert for incident."""
+        """Create summary of individual alert for incident.
+
+        Omits null/empty fields and per-alert enrichment (enrichment is
+        aggregated at the incident level instead).
+        """
+        entities = self._extract_alert_entities(alert)
         event = alert.get('event', {})
-        subject = event.get('subject', {})
         obj = event.get('object', {})
+        host = event.get('host', {})
 
-        src_ip = subject.get('ip')
-        tgt_ip = obj.get('ip')
-        # Guard: don't propagate same IP as both source and target
-        if tgt_ip and tgt_ip == src_ip:
-            tgt_ip = None
-
-        return {
-            "alert_id": alert.get('alert_id'),
-            "timestamp": alert.get('timestamp'),
-            "rule_id": alert.get('rule', {}).get('id'),
-            "rule_name": alert.get('rule', {}).get('name'),
-            "severity": alert.get('rule', {}).get('severity'),
-            "category": alert.get('rule', {}).get('category'),
-            "source_ip": src_ip,
-            "target_ip": tgt_ip,
-            "target_port": obj.get('port'),
-            "user": self._clean_user(subject.get('name')) or self._clean_user(obj.get('name')),
-            "enrichment": self._extract_enrichment_summary(alert)
-        }
+        summary: Dict[str, Any] = {}
+        # Only include fields that have actual values
+        _maybe = [
+            ("alert_id", alert.get('alert_id')),
+            ("timestamp", alert.get('timestamp')),
+            ("rule_id", alert.get('rule', {}).get('id')),
+            ("rule_name", alert.get('rule', {}).get('name')),
+            ("severity", alert.get('rule', {}).get('severity')),
+            ("category", alert.get('rule', {}).get('category')),
+            ("source_ip", entities['source_ip']),
+            ("target_ip", entities['target_ip']),
+            ("target_port", obj.get('port') or host.get('port')),
+            ("user", entities['user']),
+            ("original_event_id", event.get('event_id')),
+            ("original_signature_id", event.get('security', {}).get('signature_id')),
+            ("original_signature", event.get('security', {}).get('signature')),
+            ("original_action", event.get('enrich', {}).get('normalization', {}).get('action')),
+        ]
+        for key, val in _maybe:
+            if val is not None:
+                summary[key] = val
+        return summary
 
     def _extract_enrichment_summary(self, alert: Dict[str, Any]) -> Dict[str, Any]:
-        """Extract compact enrichment data from an alert's event."""
+        """Extract compact enrichment data with separate source/destination sections.
+
+        Skips the destination section when it is identical to source (happens
+        when L2 enriched both sides with the same IP).
+        """
         enrich = alert.get('event', {}).get('enrich', {})
         if not enrich:
             return {}
 
         summary = {}
+        source = {}
+        destination = {}
 
-        # GeoIP
+        # GeoIP — separated by src/dest
         geo = enrich.get('geo', {})
         if geo:
-            geo_out = {}
             src_geo = geo.get('src', {})
             dest_geo = geo.get('dest', {})
             if src_geo:
-                geo_out["src_country"] = src_geo.get("country")
-                geo_out["src_country_code"] = src_geo.get("country_code")
-                geo_out["src_city"] = src_geo.get("city")
+                source["geo"] = {
+                    "country": src_geo.get("country"),
+                    "country_code": src_geo.get("country_code"),
+                    "city": src_geo.get("city"),
+                }
             if dest_geo:
-                geo_out["dest_country"] = dest_geo.get("country")
-                geo_out["dest_country_code"] = dest_geo.get("country_code")
-                geo_out["dest_city"] = dest_geo.get("city")
+                destination["geo"] = {
+                    "country": dest_geo.get("country"),
+                    "country_code": dest_geo.get("country_code"),
+                    "city": dest_geo.get("city"),
+                }
             if geo.get("distance_km") is not None:
-                geo_out["distance_km"] = geo["distance_km"]
+                summary["distance_km"] = geo["distance_km"]
             if geo.get("cross_border") is not None:
-                geo_out["cross_border"] = geo["cross_border"]
-            if geo_out:
-                summary["geo"] = geo_out
+                summary["cross_border"] = geo["cross_border"]
 
-        # Network intelligence
+        # Network intelligence — separated by src/dest
         ni = enrich.get('network_intel', {})
         if ni:
-            ni_out = {}
-            for key in ('src_asn', 'dest_asn', 'src_provider', 'dest_provider',
-                        'tor_detected', 'threat_detected', 'threat_confidence',
-                        'src_reputation', 'dest_reputation'):
-                if key in ni:
-                    ni_out[key] = ni[key]
-            if ni_out:
-                summary["network_intel"] = ni_out
+            src_asn = ni.get('src_asn', {})
+            dest_asn = ni.get('dest_asn', {})
+            src_rep = ni.get('src_reputation', {})
+            dest_rep = ni.get('dest_reputation', {})
+
+            if src_asn:
+                source["asn"] = src_asn
+            if src_rep:
+                source["reputation"] = src_rep.get('ip_reputation', 'unknown')
+            source["tor_exit_node"] = bool(ni.get('tor_detected', False))
+
+            if dest_asn:
+                destination["asn"] = dest_asn
+            if dest_rep:
+                destination["reputation"] = dest_rep.get('ip_reputation', 'unknown')
+            destination["tor_exit_node"] = False
+
+        if source:
+            summary["source"] = source
+        # Only include destination if it differs from source (avoid mirrored data)
+        if destination and destination != source:
+            summary["destination"] = destination
 
         # Impossible travel
         it = enrich.get('impossible_travel')
         if it and it.get('is_impossible_travel'):
             summary["impossible_travel"] = it
+        else:
+            summary["impossible_travel"] = None
 
         # Anomalies — only include active flags
         anomalies = enrich.get('anomalies', {})
@@ -1074,21 +1199,32 @@ class UnifiedCorrelationEngine:
         return summary
 
     def _aggregate_enrichment(self, alerts: List[Dict[str, Any]]) -> Dict[str, Any]:
-        """Aggregate enrichment data across all alerts in an incident."""
-        countries = set()
-        country_codes = set()
-        cities = set()
-        asn_orgs = set()
-        providers = set()
-        tor_detected = False
-        threat_detected = False
-        max_threat_confidence = 0.0
-        max_risk_score = 0.0
+        """Aggregate enrichment data across all alerts, separated by source/destination."""
+        # Source aggregation
+        src_countries = set()
+        src_cities = set()
+        src_asn_orgs = set()
+        src_tor_detected = False
+        src_threat_detected = False
+        src_malicious_ips = []
+        src_suspicious_ips = []
+
+        # Destination aggregation
+        dest_countries = set()
+        dest_cities = set()
+        dest_asn_orgs = set()
+        dest_tor_detected = False
+        dest_threat_detected = False
+        dest_malicious_ips = []
+        dest_suspicious_ips = []
+
+        # Shared
+        cross_border = False
+        max_distance_km = None
         impossible_travel = None
         all_anomalies = set()
-        max_distance_km = None
-        cross_border = False
-        reputations = {"malicious": [], "suspicious": []}
+        max_risk_score = 0.0
+        country_codes = set()
 
         for alert in alerts:
             enrich = alert.get('event', {}).get('enrich', {})
@@ -1097,14 +1233,23 @@ class UnifiedCorrelationEngine:
 
             # Geo
             geo = enrich.get('geo', {})
-            for prefix in ('src', 'dest'):
-                g = geo.get(prefix, {})
-                if g.get('country'):
-                    countries.add(g['country'])
-                if g.get('country_code'):
-                    country_codes.add(g['country_code'])
-                if g.get('city'):
-                    cities.add(g['city'])
+            src_g = geo.get('src', {})
+            dest_g = geo.get('dest', {})
+
+            if src_g.get('country'):
+                src_countries.add(src_g['country'])
+            if src_g.get('country_code'):
+                country_codes.add(src_g['country_code'])
+            if src_g.get('city'):
+                src_cities.add(src_g['city'])
+
+            if dest_g.get('country'):
+                dest_countries.add(dest_g['country'])
+            if dest_g.get('country_code'):
+                country_codes.add(dest_g['country_code'])
+            if dest_g.get('city'):
+                dest_cities.add(dest_g['city'])
+
             if geo.get('distance_km') is not None:
                 if max_distance_km is None or geo['distance_km'] > max_distance_km:
                     max_distance_km = geo['distance_km']
@@ -1113,29 +1258,40 @@ class UnifiedCorrelationEngine:
 
             # Network intel
             ni = enrich.get('network_intel', {})
-            for key in ('src_asn', 'dest_asn'):
-                asn = ni.get(key, {})
-                if asn.get('org'):
-                    asn_orgs.add(asn['org'])
-            for key in ('src_provider', 'dest_provider'):
-                if ni.get(key):
-                    providers.add(ni[key])
-            if ni.get('tor_detected'):
-                tor_detected = True
-            if ni.get('threat_detected'):
-                threat_detected = True
-            tc = ni.get('threat_confidence', 0.0)
-            if tc and tc > max_threat_confidence:
-                max_threat_confidence = tc
+            src_asn = ni.get('src_asn', {})
+            dest_asn = ni.get('dest_asn', {})
 
-            # Reputation
-            for rep_key, ip_key in [('src_reputation', 'subject'), ('dest_reputation', 'object')]:
-                rep = ni.get(rep_key, {})
-                status = rep.get('ip_reputation')
-                if status in ('malicious', 'suspicious'):
-                    ip = alert.get('event', {}).get(ip_key, {}).get('ip')
-                    if ip and ip not in reputations[status]:
-                        reputations[status].append(ip)
+            if src_asn.get('org'):
+                src_asn_orgs.add(src_asn['org'])
+            if dest_asn.get('org'):
+                dest_asn_orgs.add(dest_asn['org'])
+
+            if ni.get('tor_detected'):
+                src_tor_detected = True
+            if ni.get('threat_detected'):
+                src_threat_detected = True
+
+            # Reputation — source
+            src_rep = ni.get('src_reputation', {})
+            src_status = src_rep.get('ip_reputation')
+            if src_status in ('malicious', 'suspicious'):
+                src_ip = alert.get('event', {}).get('subject', {}).get('ip')
+                if src_ip:
+                    if src_status == 'malicious' and src_ip not in src_malicious_ips:
+                        src_malicious_ips.append(src_ip)
+                    elif src_status == 'suspicious' and src_ip not in src_suspicious_ips:
+                        src_suspicious_ips.append(src_ip)
+
+            # Reputation — destination
+            dest_rep = ni.get('dest_reputation', {})
+            dest_status = dest_rep.get('ip_reputation')
+            if dest_status in ('malicious', 'suspicious'):
+                dest_ip = alert.get('event', {}).get('object', {}).get('ip')
+                if dest_ip:
+                    if dest_status == 'malicious' and dest_ip not in dest_malicious_ips:
+                        dest_malicious_ips.append(dest_ip)
+                    elif dest_status == 'suspicious' and dest_ip not in dest_suspicious_ips:
+                        dest_suspicious_ips.append(dest_ip)
 
             # Impossible travel
             it = enrich.get('impossible_travel')
@@ -1153,47 +1309,53 @@ class UnifiedCorrelationEngine:
             if rs and rs > max_risk_score:
                 max_risk_score = rs
 
-        result = {}
-
         # Derive cross_border from collected country codes if per-event flag missed it
         if not cross_border and len(country_codes) > 1:
             cross_border = True
 
-        if countries or max_distance_km is not None:
-            geo_agg = {}
-            if countries:
-                geo_agg["countries"] = sorted(countries)
-            if cities:
-                geo_agg["cities"] = sorted(cities)
-            if max_distance_km is not None:
-                geo_agg["max_distance_km"] = max_distance_km
-            geo_agg["cross_border"] = cross_border
-            result["geo"] = geo_agg
+        # Add cross_border to anomaly flags if true
+        if cross_border:
+            all_anomalies.add("cross_border")
+        # Check for cross-continent (simplified: >1 unique country)
+        all_countries = src_countries | dest_countries
+        if len(all_countries) > 1:
+            all_anomalies.add("cross_continent")
 
-        if asn_orgs or providers or tor_detected or threat_detected:
-            ni_agg = {}
-            if asn_orgs:
-                ni_agg["asn_orgs"] = sorted(asn_orgs)
-            if providers:
-                ni_agg["cloud_providers"] = sorted(providers)
-            ni_agg["tor_detected"] = tor_detected
-            ni_agg["threat_detected"] = threat_detected
-            if max_threat_confidence > 0:
-                ni_agg["max_threat_confidence"] = max_threat_confidence
-            if reputations["malicious"]:
-                ni_agg["malicious_ips"] = reputations["malicious"]
-            if reputations["suspicious"]:
-                ni_agg["suspicious_ips"] = reputations["suspicious"]
-            result["network_intel"] = ni_agg
+        result = {}
 
-        if impossible_travel:
-            result["impossible_travel"] = impossible_travel
+        # Source section
+        source_section = {
+            "countries": sorted(src_countries),
+            "cities": sorted(src_cities),
+            "asn_orgs": sorted(src_asn_orgs),
+            "tor_detected": src_tor_detected,
+            "threat_detected": src_threat_detected,
+            "malicious_ips": src_malicious_ips,
+            "suspicious_ips": src_suspicious_ips,
+        }
+        result["source"] = source_section
 
+        # Destination section — only include if it differs from source
+        destination_section = {
+            "countries": sorted(dest_countries),
+            "cities": sorted(dest_cities),
+            "asn_orgs": sorted(dest_asn_orgs),
+            "tor_detected": dest_tor_detected,
+            "threat_detected": dest_threat_detected,
+            "malicious_ips": dest_malicious_ips,
+            "suspicious_ips": dest_suspicious_ips,
+        }
+        if destination_section != source_section:
+            result["destination"] = destination_section
+
+        result["cross_border"] = cross_border
+        if max_distance_km is not None:
+            result["max_distance_km"] = max_distance_km
+        result["impossible_travel"] = impossible_travel
         if all_anomalies:
             result["anomaly_flags"] = sorted(all_anomalies)
-
         if max_risk_score > 0:
-            result["max_enrichment_risk_score"] = max_risk_score
+            result["max_risk_score"] = max_risk_score
 
         return result
 
@@ -1207,7 +1369,7 @@ class UnifiedCorrelationEngine:
         except (ValueError, TypeError, OverflowError):
             pass
         return 0
-    
+
     def _parse_timestamp(self, ts_str: str) -> Optional[datetime]:
         """Parse ISO8601 timestamp."""
         if not ts_str:
@@ -1216,7 +1378,7 @@ class UnifiedCorrelationEngine:
             return datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
         except (ValueError, AttributeError):
             return None
-    
+
     def _severity_rank(self, severity: str) -> int:
         """Rank severity for sorting."""
         ranks = {'critical': 4, 'high': 3, 'medium': 2, 'low': 1}
@@ -1225,7 +1387,7 @@ class UnifiedCorrelationEngine:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Unified Event Correlation Engine - Enriched Logs → Correlated Incidents"
+        description="Unified Event Correlation Engine - Enriched Logs -> Correlated Incidents"
     )
     parser.add_argument("--input", required=True, help="Input enriched logs file (JSONL)")
     parser.add_argument("--output", default="incidents.jsonl", help="Output incidents file (JSONL)")
@@ -1242,26 +1404,26 @@ def main():
                         help="Poll interval in seconds for follow mode")
     parser.add_argument("--flush-interval", type=int, default=60,
                         help="Seconds between flushing expired windows in follow mode")
-    
+
     args = parser.parse_args()
-    
+
     # Load rules
     print(f"\n{'='*70}", file=sys.stderr)
     print("UNIFIED CORRELATION ENGINE", file=sys.stderr)
     print(f"{'='*70}\n", file=sys.stderr)
-    
+
     print(f"[1/4] Loading rules from {args.rules}...", file=sys.stderr)
     try:
         with open(args.rules, 'r', encoding='utf-8') as f:
             rules_config = yaml.safe_load(f)
-        print(f"      ✓ Loaded {len(rules_config.get('rules', []))} rules\n", file=sys.stderr)
+        print(f"      Loaded {len(rules_config.get('rules', []))} rules\n", file=sys.stderr)
     except FileNotFoundError:
-        print(f"      ✗ Error: Rules file not found: {args.rules}", file=sys.stderr)
+        print(f"      Error: Rules file not found: {args.rules}", file=sys.stderr)
         sys.exit(1)
     except yaml.YAMLError as e:
-        print(f"      ✗ Error parsing YAML: {e}", file=sys.stderr)
+        print(f"      Error parsing YAML: {e}", file=sys.stderr)
         sys.exit(1)
-    
+
     # Initialize engine
     engine = UnifiedCorrelationEngine(rules_config, time_window_minutes=args.time_window)
 
@@ -1292,26 +1454,29 @@ def main():
                     append_jsonl(outfile, incident)
                     incident_count += 1
 
-                # Periodic flush of expired windows
+                # Periodic flush: fire timer-driven triggers
                 now = time.time()
                 if now - last_flush >= args.flush_interval:
-                    engine.flush_expired_windows()
+                    timer_emissions = engine.flush_trackers()
+                    for incident in timer_emissions:
+                        append_jsonl(outfile, incident)
+                        incident_count += 1
                     last_flush = now
 
                 if event_count % 500 == 0:
                     print(f"  Events: {event_count}, Incidents: {incident_count}, "
                           f"Alerts: {engine._streaming_alert_count}, "
-                          f"Open: {len(engine.open_incidents)}", file=sys.stderr)
+                          f"Active IPs: {len(engine.ip_trackers)}", file=sys.stderr)
 
         except KeyboardInterrupt:
             print("\nShutting down correlation engine...", file=sys.stderr)
         finally:
             tailer.close()
             outfile.close()
-            print(f"✓ {event_count} events -> {engine._streaming_alert_count} alerts -> "
+            print(f"{event_count} events -> {engine._streaming_alert_count} alerts -> "
                   f"{incident_count} incident emissions (follow mode)", file=sys.stderr)
     else:
-        # --- Batch mode (original behaviour) ---
+        # --- Batch mode ---
         # Load events
         print(f"[2/4] Loading enriched events from {args.input}...", file=sys.stderr)
         events = []
@@ -1327,17 +1492,17 @@ def main():
                         event = json.loads(line)
                         events.append(event)
                     except json.JSONDecodeError:
-                        print(f"      ⚠ Line {line_num}: JSON decode error", file=sys.stderr)
+                        print(f"      Line {line_num}: JSON decode error", file=sys.stderr)
                         continue
 
-            print(f"      ✓ Loaded {len(events)} events\n", file=sys.stderr)
+            print(f"      Loaded {len(events)} events\n", file=sys.stderr)
 
         except FileNotFoundError:
-            print(f"      ✗ Error: Input file not found: {args.input}", file=sys.stderr)
+            print(f"      Error: Input file not found: {args.input}", file=sys.stderr)
             sys.exit(1)
 
         if not events:
-            print("      ✗ No events to process", file=sys.stderr)
+            print("      No events to process", file=sys.stderr)
             sys.exit(1)
 
         # Process
@@ -1347,7 +1512,7 @@ def main():
         incidents = engine.process_events(events)
 
         if not incidents:
-            print("\n      ⚠ No incidents generated (no matching rules or correlation)", file=sys.stderr)
+            print("\n      No incidents generated (no matching rules or correlation)", file=sys.stderr)
             print(f"\n{'='*70}\n", file=sys.stderr)
             sys.exit(0)
 
@@ -1360,7 +1525,7 @@ def main():
                 else:
                     f.write(json.dumps(incident, separators=(",", ":"), ensure_ascii=False) + "\n")
 
-        print(f"      ✓ Done!\n", file=sys.stderr)
+        print(f"      Done!\n", file=sys.stderr)
 
         # Print summary
         print(f"{'='*70}", file=sys.stderr)
@@ -1368,8 +1533,11 @@ def main():
         print(f"{'='*70}", file=sys.stderr)
 
         for i, incident in enumerate(incidents, 1):
+            trigger = incident.get('trigger_point', {})
+            trigger_label = trigger.get('label', 'N/A')
             print(f"\n[{i}] {incident['incident_id']}: {incident['title']}", file=sys.stderr)
             print(f"    Severity: {incident['severity'].upper()}", file=sys.stderr)
+            print(f"    Trigger: {trigger_label} | Source IP: {trigger.get('source_ip', 'N/A')}", file=sys.stderr)
             print(f"    Alerts Correlated: {incident['alert_count']}", file=sys.stderr)
             print(f"    Attack Pattern: {incident['attack_chain']['attack_pattern']}", file=sys.stderr)
             print(f"    Confidence: {incident['attack_chain']['campaign_confidence']}", file=sys.stderr)
@@ -1392,14 +1560,16 @@ def main():
             print("\nDETAILED STATISTICS", file=sys.stderr)
             print("="*70, file=sys.stderr)
 
-            # Count by severity
             severity_counts = defaultdict(int)
             category_counts = defaultdict(int)
+            trigger_counts = defaultdict(int)
 
             for incident in incidents:
                 severity_counts[incident['severity']] += 1
                 category = incident.get('attack_chain', {}).get('attack_pattern', 'Unknown')
                 category_counts[category] += 1
+                trigger_label = incident.get('trigger_point', {}).get('label', 'unknown')
+                trigger_counts[trigger_label] += 1
 
             print("\nIncidents by Severity:", file=sys.stderr)
             for severity in ['critical', 'high', 'medium', 'low']:
@@ -1409,6 +1579,10 @@ def main():
             print("\nIncidents by Attack Pattern:", file=sys.stderr)
             for pattern, count in sorted(category_counts.items(), key=lambda x: x[1], reverse=True):
                 print(f"  {pattern}: {count}", file=sys.stderr)
+
+            print("\nIncidents by Trigger Point:", file=sys.stderr)
+            for label, count in sorted(trigger_counts.items()):
+                print(f"  {label}: {count}", file=sys.stderr)
 
             print(f"\n{'='*70}\n", file=sys.stderr)
 
